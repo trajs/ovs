@@ -88,6 +88,60 @@ AT_CHECK([ovs-ofctl parse-pcap p0.pcap | tail -n 2 | grep -o 'ipv6_label=0x[[0-9
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
+AT_SETUP([tunnel_push_pop_ipv6 - esp])
+AT_KEYWORDS([ipsec])
+AT_SKIP_IF([test "$HAVE_OPENSSL" = no])
+
+OVS_VSWITCHD_START([add-port br0 p0 -- set Interface p0 type=dummy dnl
+                    ofport_request=1 other-config:hwaddr=aa:55:aa:55:00:00 dnl
+                    options:tx_pcap=p0.pcap])
+AT_CHECK([ovs-vsctl add-br int-br -- set bridge int-br datapath_type=dummy])
+AT_CHECK([ovs-vsctl add-port int-br t1 -- set Interface t1 type=esp dnl
+            ofport_request=2 options:remote_ip=2001:cafe::92 dnl
+            options:esp_in_spi=4096 options:esp_out_spi=8192 dnl
+            options:esp_in_key=0x101112131415161718191a1b1c1d1e1fcafebabe dnl
+            options:esp_out_key=0x202122232425262728292a2b2c2d2e2fdeadbeef dnl
+            -- add-port int-br p1 -- set Interface p1 type=dummy dnl
+            ofport_request=3 options:tx_pcap=p1.pcap])
+
+AT_CHECK([ovs-appctl netdev-dummy/ip6addr br0 2001:cafe::88/24], [0], [OK
+])
+AT_CHECK([ovs-appctl tnl/neigh/set br0 2001:cafe::92 aa:55:aa:55:00:01], [0], [OK
+])
+AT_CHECK([ovs-ofctl add-flow br0 action=normal])
+AT_CHECK([ovs-ofctl add-flow int-br in_port=t1,action=p1])
+AT_CHECK([ovs-ofctl add-flow int-br in_port=p1,action=t1])
+
+dnl Encapsulation of an IPv6 packet.
+AT_CHECK([ovs-appctl ofproto/trace --names int-br dnl
+            in_port=p1,dl_src=f8:bc:12:44:34:b6,dl_dst=aa:55:aa:55:00:00,dnl
+udp6,ipv6_src=2001:beef::1,ipv6_dst=2001:beef::2,nw_ttl=64,udp_src=1,udp_dst=2],
+         [0], [stdout])
+AT_CHECK([tail -1 stdout], [0], [dnl
+Datapath actions: pop_eth,tnl_push(tnl_port(esp_sys),header(size=70,type=113,eth(dst=aa:55:aa:55:00:01,src=aa:55:aa:55:00:00,dl_type=0x86dd),ipv6(src=2001:cafe::88,dst=2001:cafe::92,label=0,proto=50,tclass=0x0,hlimit=64),esp(spi=0x2000)),out_port(br0)),p0
+])
+
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 dnl
+  'eth(src=f8:bc:12:44:34:b6,dst=aa:55:aa:55:00:00),eth_type(0x86dd),ipv6(src=2001:beef::1,dst=2001:beef::2,label=0,proto=17,tclass=0x0,hlimit=64,frag=no),udp(src=1,dst=2)'])
+OVS_WAIT_UNTIL([test $(ovs-pcap p0.pcap | wc -l) -ge 1])
+
+dnl Only check the headers before the random IV.  The 112-byte inner packet
+dnl becomes 16 + 112 + 2 (padding) + 2 + 16 bytes of ESP.
+AT_CHECK([ovs-pcap p0.pcap | cut -c1-124], [0], [dnl
+aa55aa550001aa55aa55000086dd60000000009432402001cafe0000000000000000000000882001cafe0000000000000000000000920000200000000001
+])
+
+dnl Decapsulation of a packet encrypted by an independent implementation.
+AT_CHECK([ovs-appctl netdev-dummy/receive p0 dnl
+aa55aa550000aa55aa55000186dd60000000004c32402001cafe0000000000000000000000922001cafe00000000000000000000008800001000000000010102030405060708319779ecb7385859a48de241704608a2b76f467926ada1846103e4f0c011b294f83a80b9ba98e1cfbfd7b9421e33c5e1a7d8e84de7b0d2a39cfc4887])
+OVS_WAIT_UNTIL([test $(ovs-pcap p1.pcap | wc -l) -ge 1])
+AT_CHECK([ovs-pcap p1.pcap], [0], [dnl
+00000000000000000000000008004500002800004000401126c30a0000020a00000100c80064001400006f76732d6573702d74657374
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
 AT_SETUP([tunnel_push_pop_ipv6 - ip6gre])
 
 OVS_VSWITCHD_START([add-port br0 p0 -- set Interface p0 type=dummy ofport_request=1 other-config:hwaddr=aa:55:aa:55:00:00])

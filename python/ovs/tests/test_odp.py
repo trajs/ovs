@@ -476,6 +476,21 @@ def test_odp_fields(input_string, expected):
             ],
         ),
         (
+            "actions:tnl_push(header(esp(spi=0x1000)))",
+            [
+                KeyValue(
+                    "tnl_push",
+                    {
+                        "header": {
+                            "esp": {
+                                "spi": 0x1000,
+                            }
+                        }
+                    },
+                ),
+            ],
+        ),
+        (
             "actions:clone(1),clone(clone(push_vlan(vid=12,pcp=0),2),1)",
             [
                 KeyValue("clone", [{"output": {"port": 1}}]),

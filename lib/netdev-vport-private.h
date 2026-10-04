@@ -25,6 +25,8 @@
 #include "ovs-atomic.h"
 #include "ovs-thread.h"
 
+struct esp_sa;
+
 struct netdev_vport {
     struct netdev up;
 
@@ -45,6 +47,11 @@ struct netdev_vport {
 
     /* Patch Ports. */
     char *peer;
+
+    /* ESP tunnels.  These security associations are in the ESP SA database,
+     * where the datapath finds them.  Only used by the main thread. */
+    struct esp_sa *esp_in_sa;
+    struct esp_sa *esp_out_sa;
 };
 
 int netdev_vport_construct(struct netdev *);

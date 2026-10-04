@@ -333,6 +333,15 @@ m4_define([OVS_CHECK_SRV6],
      AT_CHECK([ip -6 route del fc00::1/96 2>&1 >/dev/null])
      OVS_CHECK_FIREWALL()])
 
+# OVS_CHECK_ESP()
+#
+# ESP tunnels need OpenSSL, and the tests check interoperability with the
+# kernel's IPsec implementation.
+m4_define([OVS_CHECK_ESP],
+    [AT_SKIP_IF([test "$HAVE_OPENSSL" = no])
+     AT_SKIP_IF([! ip xfrm state list > /dev/null 2>&1])
+     OVS_CHECK_FIREWALL()])
+
 # CHECK_LATER_IPV6_FRAGMENTS()
 #
 # Userspace is parsing later IPv6 fragments correctly.

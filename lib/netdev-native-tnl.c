@@ -37,6 +37,7 @@
 #include "csum.h"
 #include "dp-packet.h"
 #include "dpif-offload.h"
+#include "esp.h"
 #include "netdev.h"
 #include "netdev-vport.h"
 #include "netdev-vport-private.h"
@@ -1105,6 +1106,122 @@ netdev_srv6_pop_header(struct dp_packet *packet)
     }
 
     tnl_ol_pop(packet, hlen);
+
+    return packet;
+err:
+    dp_packet_delete(packet);
+    return NULL;
+}
+
+int
+netdev_esp_build_header(const struct netdev *netdev,
+                        struct ovs_action_push_tnl *data,
+                        const struct netdev_tnl_build_header_params *params)
+{
+    const struct netdev_tunnel_config *tnl_cfg;
+    struct esp_header *esp;
+
+    /* netdev_esp_push_header() finds the outbound SA from this SPI and the
+     * destination address, and fills in the rest of the ESP header. */
+    tnl_cfg = netdev_get_tunnel_config(netdev);
+    esp = netdev_tnl_ip_build_header(data, params, IPPROTO_ESP, 0);
+    put_16aligned_be32(&esp->spi, tnl_cfg->esp_out_spi);
+    put_16aligned_be32(&esp->seq_no, 0);
+    memset(esp + 1, 0, ESP_IV_LEN);
+
+    data->header_len += ESP_PREFIX_LEN;
+    data->tnl_type = OVS_VPORT_TYPE_ESP;
+
+    return 0;
+}
+
+int
+netdev_esp_push_header(const struct netdev *netdev,
+                       const struct netdev *ingress_netdev OVS_UNUSED,
+                       struct dp_packet *packet,
+                       const struct ovs_action_push_tnl *data)
+{
+    struct esp_header *esp;
+    struct in6_addr dst;
+    size_t payload_len;
+    struct esp_sa *sa;
+    uint8_t next_hdr;
+    int ip_tot_size;
+
+    if (packet->packet_type == htonl(PT_IPV4)) {
+        next_hdr = IPPROTO_IPIP;
+    } else if (packet->packet_type == htonl(PT_IPV6)) {
+        next_hdr = IPPROTO_IPV6;
+    } else {
+        VLOG_WARN_RL(&err_rl, "%s: esp tunnels only carry IP packets",
+                     netdev_get_name(netdev));
+        return EPROTONOSUPPORT;
+    }
+
+    /* Do not encrypt Ethernet padding. */
+    payload_len = dp_packet_size(packet) - dp_packet_l2_pad_size(packet);
+    dp_packet_set_size(packet, payload_len);
+
+    dp_packet_put_uninit(packet, esp_trailer_len(payload_len));
+    esp = netdev_tnl_push_ip_header(packet, data->header, data->header_len,
+                                    &ip_tot_size, 0);
+
+    /* 'netdev' is the datapath port shared by all esp tunnels, so find the
+     * outbound SA from the SPI and destination in the header. */
+    if (netdev_tnl_is_header_ipv6(data->header)) {
+        const struct ovs_16aligned_ip6_hdr *ip6 = dp_packet_l3(packet);
+
+        memcpy(&dst, &ip6->ip6_dst, sizeof dst);
+    } else {
+        const struct ip_header *ip = dp_packet_l3(packet);
+
+        in6_addr_set_mapped_ipv4(&dst, get_16aligned_be32(&ip->ip_dst));
+    }
+    sa = esp_sad_lookup(get_16aligned_be32(&esp->spi), &dst);
+    if (OVS_UNLIKELY(!sa)) {
+        return ENOENT;
+    }
+
+    return esp_seal(sa, esp, payload_len, next_hdr);
+}
+
+struct dp_packet *
+netdev_esp_pop_header(struct dp_packet *packet)
+{
+    struct pkt_metadata *md = &packet->md;
+    struct flow_tnl *tnl = &md->tunnel;
+    size_t esp_len, payload_len;
+    struct esp_header *esp;
+    unsigned int hlen;
+    uint8_t next_hdr;
+    ovs_be32 spi;
+
+    pkt_metadata_init_tnl(md);
+    esp = ip_extract_tnl_md(packet, tnl, &hlen);
+    if (!esp) {
+        goto err;
+    }
+
+    esp_len = dp_packet_size(packet) - dp_packet_l2_pad_size(packet) - hlen;
+    if (esp_open(esp, esp_len, &spi, &next_hdr, &payload_len)) {
+        goto err;
+    }
+
+    if (next_hdr == IPPROTO_IPIP) {
+        packet->packet_type = htonl(PT_IPV4);
+    } else if (next_hdr == IPPROTO_IPV6) {
+        packet->packet_type = htonl(PT_IPV6);
+    } else {
+        /* This includes dummy packets (IPPROTO_NONE), which must be
+         * discarded (RFC 4303 section 2.6). */
+        goto err;
+    }
+
+    tnl->tun_id = htonll(ntohl(spi));
+    tnl->flags |= FLOW_TNL_F_KEY;
+
+    dp_packet_reset_packet(packet, hlen + ESP_PREFIX_LEN);
+    dp_packet_set_size(packet, payload_len);
 
     return packet;
 err:

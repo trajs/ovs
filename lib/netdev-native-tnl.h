@@ -79,6 +79,17 @@ int netdev_srv6_build_header(const struct netdev *,
                              struct ovs_action_push_tnl *,
                              const struct netdev_tnl_build_header_params *);
 
+struct dp_packet *netdev_esp_pop_header(struct dp_packet *);
+
+int netdev_esp_push_header(const struct netdev *,
+                           const struct netdev *ingress_netdev,
+                           struct dp_packet *,
+                           const struct ovs_action_push_tnl *);
+
+int netdev_esp_build_header(const struct netdev *,
+                            struct ovs_action_push_tnl *,
+                            const struct netdev_tnl_build_header_params *);
+
 int
 netdev_tnl_push_udp_header(const struct netdev *netdev,
                            const struct netdev *ingress_netdev,

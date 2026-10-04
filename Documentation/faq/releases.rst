@@ -101,6 +101,7 @@ Q: Are all features available with all datapaths?
     Tunnel - ERSPAN-IPv6           4.18        2.10
     Tunnel - GTP-U                 NO          2.14
     Tunnel - SRv6                  NO          3.2
+    Tunnel - ESP (IPsec)           NO          4.1
     Tunnel - Bareudp               5.7         NO
     QoS - Policing                 YES         2.6
     QoS - Shaping                  YES         NO

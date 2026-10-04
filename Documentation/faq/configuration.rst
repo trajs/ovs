@@ -259,6 +259,51 @@ Q: Does Open vSwitch support SRv6?
                 options:remote_ip=fc00:100::1 \
                 options:srv6_segs="fc00:100::1,fc00:200::1,fc00:300::1"
 
+Q: Does the userspace datapath, for example with DPDK, support IPsec?
+
+    A: Yes.  Starting with version 4.1, the userspace datapath supports an
+    ``esp`` tunnel type, which carries IPv4 and IPv6 packets in IPsec ESP
+    tunnel mode (RFC 4303) with AES-GCM (RFC 4106).  The datapath threads
+    encrypt and decrypt the packets themselves, so this requires Open vSwitch
+    to be built with OpenSSL.
+
+    This is different from the IPsec support described in
+    :doc:`/howto/ipsec`, where ``ovs-monitor-ipsec`` has the Linux kernel
+    encrypt ``gre``, ``geneve`` and ``vxlan`` tunnels of the kernel datapath.
+
+    The following example creates a tunnel to 172.31.1.1, and the commands
+    after it configure the Linux kernel of that host as the other end::
+
+        $ ovs-vsctl add-port br0 esp0 -- set int esp0 type=esp \
+                options:remote_ip=172.31.1.1 \
+                options:esp_in_spi=0x1000 options:esp_out_spi=0x2000 \
+                options:esp_in_key=0x<40 hex digits> \
+                options:esp_out_key=0x<40 other hex digits>
+
+        $ ip xfrm state add src 172.31.1.100 dst 172.31.1.1 proto esp \
+                spi 0x2000 mode tunnel replay-window 64 \
+                aead 'rfc4106(gcm(aes))' 0x<esp_out_key digits> 128
+        $ ip xfrm state add src 172.31.1.1 dst 172.31.1.100 proto esp \
+                spi 0x1000 mode tunnel replay-window 64 \
+                aead 'rfc4106(gcm(aes))' 0x<esp_in_key digits> 128
+
+    plus ``ip xfrm policy`` rules for the traffic to protect.  Received
+    packets have their SPI in ``tun_id``.
+
+    The current implementation has these restrictions:
+
+    * Keys are configured manually.  Key exchange (IKE) is not supported yet.
+
+    * Only tunnel mode, without UDP encapsulation for NAT traversal.
+
+    * Encapsulated packets are not fragmented, and received ESP packets that
+      are fragments are not reassembled, so the MTU of the inner interfaces
+      must leave room for up to 57 bytes of overhead with an IPv4 underlay
+      and 77 with IPv6.
+
+    * With userspace TSO enabled, packets that need TCP segmentation are
+      dropped.
+
 Q: How do I connect two bridges?
 
     A: First, why do you want to do this?  Two connected bridges are not much

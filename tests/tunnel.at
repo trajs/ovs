@@ -1350,6 +1350,86 @@ AT_CHECK([tail -1 stdout], [0],
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
+AT_SETUP([tunnel - ESP configuration])
+AT_KEYWORDS([ipsec])
+AT_SKIP_IF([test "$HAVE_OPENSSL" = no])
+m4_define([KEY1], [0x101112131415161718191a1b1c1d1e1fcafebabe])
+m4_define([KEY2], [0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1fdeadbeef])
+OVS_VSWITCHD_START([add-port br0 p1 -- set Interface p1 type=esp dnl
+                    options:remote_ip=1.1.1.1 options:esp_in_spi=0x1000 dnl
+                    options:esp_out_spi=8192 options:esp_in_key=KEY1 dnl
+                    options:esp_out_key=KEY2 options:esp_esn=true dnl
+                    options:esp_replay_window=1024 ofport_request=1])
+
+AT_CHECK([ovs-appctl dpif/show | grep p1 | sed 's|1/[[0-9]]*|1/X|'], [0], [dnl
+    p1 1/X: (esp: esp_esn=true, esp_in_spi=4096, esp_out_spi=8192, esp_replay_window=1024, remote_ip=1.1.1.1)
+])
+dnl The tunnel IDs are the SPIs.
+AT_CHECK([ovs-appctl ofproto/list-tunnels | sed 's/port[[ =]][[0-9]]*/port X/g'],
+         [0], [dnl
+port X: p1 (esp: ::->1.1.1.1, key=0x1000, legacy_l3, dp port X, out_key=0x2000, ttl=64)
+])
+
+dnl Configuration errors.
+m4_define([ADD_ESP], [ovs-vsctl add-port br0 $1 -- set Interface $1 type=esp dnl
+                      options:remote_ip=1.1.1.2 $2])
+m4_define([CHECK_ERROR], [dnl
+AT_CHECK([ADD_ESP([$1], [$2])], [65], [], [ignore])
+AT_CHECK([grep "$1: $3" ovs-vswitchd.log | sed 's/^.*|WARN|//'], [0], [$1: $3
+])
+AT_CHECK([ovs-vsctl del-port br0 $1])])
+
+CHECK_ERROR([p2], [options:esp_out_spi=8192 options:esp_in_key=KEY1 dnl
+                   options:esp_out_key=KEY1],
+            [esp tunnels require 'esp_in_spi' between 256 and 4294967295])
+CHECK_ERROR([p3], [options:esp_in_spi=255 options:esp_out_spi=8192 dnl
+                   options:esp_in_key=KEY1 options:esp_out_key=KEY1],
+            [esp tunnels require 'esp_in_spi' between 256 and 4294967295])
+CHECK_ERROR([p4], [options:esp_in_spi=4097 options:esp_out_spi=8192 dnl
+                   options:esp_out_key=KEY1],
+            [bad 'esp_in_key': missing])
+CHECK_ERROR([p5], [options:esp_in_spi=4097 options:esp_out_spi=8192 dnl
+                   options:esp_in_key=KEY1 options:esp_out_key=0x1234],
+            [bad 'esp_out_key': key must be 20, 28 or 36 bytes (an AES-128, -192 or -256 key followed by a 4-byte salt), got 4 hex digits])
+CHECK_ERROR([p6], [options:esp_in_spi=4096 options:esp_out_spi=8192 dnl
+                   options:esp_in_key=KEY1 options:esp_out_key=KEY1],
+            ['esp_in_spi' 4096 is already used by another esp tunnel])
+CHECK_ERROR([p7], [options:esp_in_spi=4097 options:esp_out_spi=8192 dnl
+                   options:esp_in_key=KEY1 options:esp_out_key=KEY1 dnl
+                   options:key=5],
+            [esp tunnels do not support 'key', 'in_key' or 'out_key', the tunnel ID is the inbound SPI])
+CHECK_ERROR([p8], [options:esp_in_spi=4097 options:esp_out_spi=8192 dnl
+                   options:esp_in_key=KEY1 options:esp_out_key=KEY1 dnl
+                   options:esp_esn=true options:esp_replay_window=0],
+            ['esp_replay_window' must be between 1 and 4096])
+
+dnl The same outbound SPI is fine towards another peer, but not towards the
+dnl same one.
+AT_CHECK([ADD_ESP([p9], [options:esp_in_spi=4097 options:esp_out_spi=8192 dnl
+                         options:esp_in_key=KEY1 options:esp_out_key=KEY1])])
+AT_CHECK([ovs-vsctl set Interface p9 options:remote_ip=1.1.1.1], [0], [],
+         [ignore])
+AT_CHECK([grep "p9: 'esp_out_spi' 8192 is already used by another esp tunnel to the same 'remote_ip'" ovs-vswitchd.log], [0], [ignore])
+
+dnl Changing the SPIs and keys of an existing tunnel.
+AT_CHECK([ovs-vsctl set Interface p1 options:esp_in_spi=4098 dnl
+                                      options:esp_in_key=KEY2])
+AT_CHECK([ovs-vsctl set Interface p9 options:remote_ip=1.1.1.2 dnl
+                                      options:esp_in_spi=4096])
+AT_CHECK([ovs-appctl dpif/show | grep 'p[[19]] ' | sed 's|[[0-9]]*/[[0-9]]*:|X/X:|'],
+         [0], [dnl
+    p1 X/X: (esp: esp_esn=true, esp_in_spi=4098, esp_out_spi=8192, esp_replay_window=1024, remote_ip=1.1.1.1)
+    p9 X/X: (esp: esp_in_spi=4096, esp_out_spi=8192, remote_ip=1.1.1.2)
+])
+
+OVS_VSWITCHD_STOP(["/could not set configuration/d
+/: esp tunnels require/d
+/: bad 'esp_/d
+/is already used by another esp tunnel/d
+/: esp tunnels do not support/d
+/: 'esp_replay_window' must be/d"])
+AT_CLEANUP
+
 AT_SETUP([tunnel - Geneve metadata mirror])
 OVS_VSWITCHD_START([add-port br0 p1 -- set Interface p1 type=geneve \
                     options:remote_ip=1.1.1.1 ofport_request=1 \

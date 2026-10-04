@@ -32,6 +32,7 @@
 #include "daemon.h"
 #include "dirs.h"
 #include "dpif.h"
+#include "esp.h"
 #include "netdev.h"
 #include "netdev-native-tnl.h"
 #include "netdev-provider.h"
@@ -244,6 +245,15 @@ netdev_vport_destruct(struct netdev *netdev_)
 
     if (!strcmp(type, "vxlan")) {
         update_vxlan_global_cfg(netdev_, tnl_cfg, NULL);
+    }
+
+    if (netdev->esp_in_sa) {
+        esp_sad_remove(netdev->esp_in_sa);
+        esp_sa_destroy_postponed(netdev->esp_in_sa);
+    }
+    if (netdev->esp_out_sa) {
+        esp_sad_remove(netdev->esp_out_sa);
+        esp_sa_destroy_postponed(netdev->esp_out_sa);
     }
 
     ovsrcu_set(&netdev->tnl_cfg, NULL);
@@ -482,6 +492,8 @@ tunnel_supported_layers(const char *type,
         return TNL_L3;
     } else if (!strcmp(type, "srv6")) {
         return TNL_L3;
+    } else if (!strcmp(type, "esp")) {
+        return TNL_L3;
     } else {
         return TNL_L2;
     }
@@ -604,6 +616,190 @@ is_concomitant_vxlan_tunnel_present(struct netdev_vport *dev,
     return false;
 }
 
+/* Parses 's' as an ESP SPI.  SPIs 1 to 255 are reserved (RFC 4303). */
+static bool
+parse_esp_spi(const char *s, ovs_be32 *spi)
+{
+    unsigned long long int value;
+    char *tail;
+
+    errno = 0;
+    value = strtoull(s, &tail, 0);
+    if (errno || *tail || tail == s || value < 256 || value > UINT32_MAX) {
+        return false;
+    }
+    *spi = htonl(value);
+    return true;
+}
+
+static bool
+is_esp_option(const char *key)
+{
+    return (!strcmp(key, "esp_in_spi") || !strcmp(key, "esp_out_spi")
+            || !strcmp(key, "esp_in_key") || !strcmp(key, "esp_out_key")
+            || !strcmp(key, "esp_esn") || !strcmp(key, "esp_replay_window"));
+}
+
+/* Parses the ESP options in 'args' for ESP tunnel 'dev', checks them against
+ * 'tnl_cfg' and completes 'tnl_cfg'.  Creates in '*new_in' and '*new_out' the
+ * security associations whose parameters changed, or sets them to NULL.
+ *
+ * Returns 0 if successful, otherwise appends an error to 'errors' and
+ * returns a positive errno value. */
+static int
+esp_tunnel_config(struct netdev_vport *dev, const struct smap *args,
+                  struct netdev_tunnel_config *tnl_cfg,
+                  struct esp_sa **new_in, struct esp_sa **new_out,
+                  struct ds *errors)
+{
+    const char *name = netdev_get_name(&dev->up);
+    struct esp_sa *cur_in, *cur_out, *other;
+    struct esp_sa_params in, out;
+    const char *s;
+    char *error;
+
+    *new_in = *new_out = NULL;
+
+    if (!esp_is_supported()) {
+        ds_put_format(errors, "%s: esp tunnels require Open vSwitch built "
+                      "with OpenSSL\n", name);
+        return EOPNOTSUPP;
+    }
+    if (tnl_cfg->ip_dst_flow || tnl_cfg->ip_src_flow) {
+        ds_put_format(errors, "%s: esp tunnels do not support "
+                      "'remote_ip=flow' or 'local_ip=flow'\n", name);
+        return EINVAL;
+    }
+    if (smap_get(args, "key") || smap_get(args, "in_key")
+        || smap_get(args, "out_key")) {
+        ds_put_format(errors, "%s: esp tunnels do not support 'key', "
+                      "'in_key' or 'out_key', the tunnel ID is the "
+                      "inbound SPI\n", name);
+        return EINVAL;
+    }
+
+    memset(&in, 0, sizeof in);
+    memset(&out, 0, sizeof out);
+
+    s = smap_get(args, "esp_in_spi");
+    if (!s || !parse_esp_spi(s, &in.spi)) {
+        ds_put_format(errors, "%s: esp tunnels require 'esp_in_spi' "
+                      "between 256 and 4294967295\n", name);
+        return EINVAL;
+    }
+    s = smap_get(args, "esp_out_spi");
+    if (!s || !parse_esp_spi(s, &out.spi)) {
+        ds_put_format(errors, "%s: esp tunnels require 'esp_out_spi' "
+                      "between 256 and 4294967295\n", name);
+        return EINVAL;
+    }
+
+    s = smap_get(args, "esp_in_key");
+    error = s ? esp_parse_key(s, &in) : xstrdup("missing");
+    if (error) {
+        ds_put_format(errors, "%s: bad 'esp_in_key': %s\n", name, error);
+        free(error);
+        return EINVAL;
+    }
+    s = smap_get(args, "esp_out_key");
+    error = s ? esp_parse_key(s, &out) : xstrdup("missing");
+    if (error) {
+        ds_put_format(errors, "%s: bad 'esp_out_key': %s\n", name, error);
+        free(error);
+        return EINVAL;
+    }
+
+    in.esn = out.esn = smap_get_bool(args, "esp_esn", false);
+    in.replay_window = smap_get_uint(args, "esp_replay_window",
+                                     ESP_DEFAULT_REPLAY_WINDOW);
+    if (in.replay_window > ESP_MAX_REPLAY_WINDOW
+        || (in.esn && !in.replay_window)) {
+        ds_put_format(errors, "%s: 'esp_replay_window' must be between "
+                      "%d and %d\n", name, in.esn ? 1 : 0,
+                      ESP_MAX_REPLAY_WINDOW);
+        return EINVAL;
+    }
+
+    /* An SA is identified by its SPI and, for outbound SAs, the peer's
+     * address.  Two tunnels cannot share one. */
+    out.dst = tnl_cfg->ipv6_dst;
+    cur_in = dev->esp_in_sa;
+    other = esp_sad_lookup(in.spi, &in.dst);
+    if (other && other != cur_in) {
+        ds_put_format(errors, "%s: 'esp_in_spi' %"PRIu32" is already used "
+                      "by another esp tunnel\n", name, ntohl(in.spi));
+        return EEXIST;
+    }
+    cur_out = dev->esp_out_sa;
+    other = esp_sad_lookup(out.spi, &out.dst);
+    if (other && other != cur_out) {
+        ds_put_format(errors, "%s: 'esp_out_spi' %"PRIu32" is already used "
+                      "by another esp tunnel to the same 'remote_ip'\n",
+                      name, ntohl(out.spi));
+        return EEXIST;
+    }
+
+    /* Keep the SAs whose parameters do not change, so that their sequence
+     * numbers and anti-replay windows carry on. */
+    if (!cur_in || !esp_sa_params_equal(esp_sa_get_params(cur_in), &in)) {
+        *new_in = esp_sa_create(&in);
+        if (!*new_in) {
+            goto create_error;
+        }
+    }
+    if (!cur_out || !esp_sa_params_equal(esp_sa_get_params(cur_out), &out)) {
+        *new_out = esp_sa_create(&out);
+        if (!*new_out) {
+            goto create_error;
+        }
+    }
+
+    tnl_cfg->esp_in_spi = in.spi;
+    tnl_cfg->esp_out_spi = out.spi;
+    tnl_cfg->esp_esn = in.esn;
+    tnl_cfg->esp_replay_window = in.replay_window;
+
+    /* Received packets carry the inbound SPI as their tunnel ID. */
+    tnl_cfg->in_key = htonll(ntohl(in.spi));
+    tnl_cfg->in_key_present = true;
+    tnl_cfg->out_key = htonll(ntohl(out.spi));
+    tnl_cfg->out_key_present = true;
+
+    return 0;
+
+create_error:
+    esp_sa_destroy(*new_in);
+    *new_in = NULL;
+    ds_put_format(errors, "%s: failed to create esp security association\n",
+                  name);
+    return EINVAL;
+}
+
+/* Replaces the SA in '*cur', if any, by 'new', if nonnull, in the SAD. */
+static void
+esp_tunnel_install_sa(struct esp_sa **cur, struct esp_sa *new)
+{
+    const struct esp_sa_params *new_p;
+    struct esp_sa *old = *cur;
+
+    if (!new) {
+        return;
+    }
+
+    new_p = esp_sa_get_params(new);
+    if (old && esp_sa_get_params(old)->spi == new_p->spi
+        && ipv6_addr_equals(&esp_sa_get_params(old)->dst, &new_p->dst)) {
+        esp_sad_replace(old, new);
+    } else {
+        if (old) {
+            esp_sad_remove(old);
+        }
+        ovs_assert(!esp_sad_insert(new));
+    }
+    *cur = new;
+    esp_sa_destroy_postponed(old);
+}
+
 static int
 set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
 {
@@ -612,7 +808,8 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
     const char *name = netdev_get_name(dev_);
     const char *type = netdev_get_type(dev_);
     struct ds errors = DS_EMPTY_INITIALIZER;
-    bool needs_dst_port, has_csum, has_seq;
+    bool needs_dst_port, has_csum, has_seq, is_esp;
+    struct esp_sa *esp_in = NULL, *esp_out = NULL;
     uint16_t dst_proto = 0, src_proto = 0;
     struct netdev_tunnel_config tnl_cfg;
     struct smap_node *node;
@@ -621,6 +818,7 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
     has_csum = strstr(type, "gre") || strstr(type, "geneve") ||
                strstr(type, "vxlan");
     has_seq = strstr(type, "gre");
+    is_esp = !strcmp(type, "esp");
     memset(&tnl_cfg, 0, sizeof tnl_cfg);
 
     /* Add a default destination port for tunnel ports if none specified. */
@@ -700,7 +898,8 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
         } else if (!strcmp(node->key, "key") ||
                    !strcmp(node->key, "in_key") ||
                    !strcmp(node->key, "out_key") ||
-                   !strcmp(node->key, "packet_type")) {
+                   !strcmp(node->key, "packet_type") ||
+                   (is_esp && is_esp_option(node->key))) {
             /* Handled separately below. */
         } else if (!strcmp(node->key, "exts") && !strcmp(type, "vxlan")) {
             char *str = xstrdup(node->value);
@@ -918,6 +1117,14 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
                                &tnl_cfg.out_key_present,
                                &tnl_cfg.out_key_flow);
 
+    if (is_esp) {
+        err = esp_tunnel_config(dev, args, &tnl_cfg, &esp_in, &esp_out,
+                                &errors);
+        if (err) {
+            goto out;
+        }
+    }
+
     if (is_concomitant_vxlan_tunnel_present(dev, &tnl_cfg)) {
         ds_put_format(&errors, "%s: VXLAN-GBP, and non-VXLAN-GBP "
                       "tunnels can't be configured on the same "
@@ -928,6 +1135,9 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
     }
 
     ovs_mutex_lock(&dev->mutex);
+
+    esp_tunnel_install_sa(&dev->esp_in_sa, esp_in);
+    esp_tunnel_install_sa(&dev->esp_out_sa, esp_out);
 
     curr_tnl_cfg = vport_tunnel_config(dev);
     update_vxlan_global_cfg(dev_, curr_tnl_cfg, &tnl_cfg);
@@ -944,6 +1154,10 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
     err = 0;
 
 out:
+    if (err) {
+        esp_sa_destroy(esp_in);
+        esp_sa_destroy(esp_out);
+    }
     if (errors.length) {
         ds_chomp(&errors, '\n');
         VLOG_WARN("%s", ds_cstr(&errors));
@@ -979,7 +1193,20 @@ get_tunnel_config(const struct netdev *dev, struct smap *args)
         smap_add(args, "local_ip", "flow");
     }
 
-    if (tnl_cfg->in_key_flow && tnl_cfg->out_key_flow) {
+    if (!strcmp(type, "esp")) {
+        /* The keys are derived from the SPIs.  The ESP keys are secret. */
+        smap_add_format(args, "esp_in_spi", "%"PRIu32,
+                        ntohl(tnl_cfg->esp_in_spi));
+        smap_add_format(args, "esp_out_spi", "%"PRIu32,
+                        ntohl(tnl_cfg->esp_out_spi));
+        if (tnl_cfg->esp_esn) {
+            smap_add(args, "esp_esn", "true");
+        }
+        if (tnl_cfg->esp_replay_window != ESP_DEFAULT_REPLAY_WINDOW) {
+            smap_add_format(args, "esp_replay_window", "%"PRIu16,
+                            tnl_cfg->esp_replay_window);
+        }
+    } else if (tnl_cfg->in_key_flow && tnl_cfg->out_key_flow) {
         smap_add(args, "key", "flow");
     } else if (tnl_cfg->in_key_present && tnl_cfg->out_key_present
                && tnl_cfg->in_key == tnl_cfg->out_key) {
@@ -1357,6 +1584,17 @@ netdev_vport_tunnel_register(void)
               .build_header = netdev_srv6_build_header,
               .push_header = netdev_srv6_push_header,
               .pop_header = netdev_srv6_pop_header,
+              .get_ifindex = NETDEV_VPORT_GET_IFINDEX,
+          },
+          {{NULL, NULL, 0, 0}}
+        },
+        { "esp_sys",
+          {
+              TUNNEL_FUNCTIONS_COMMON,
+              .type = "esp",
+              .build_header = netdev_esp_build_header,
+              .push_header = netdev_esp_push_header,
+              .pop_header = netdev_esp_pop_header,
               .get_ifindex = NETDEV_VPORT_GET_IFINDEX,
           },
           {{NULL, NULL, 0, 0}}

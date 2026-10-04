@@ -133,6 +133,7 @@ vport_type_to_kind(enum ovs_vport_type type,
     case OVS_VPORT_TYPE_INTERNAL:
     case OVS_VPORT_TYPE_GTPU:
     case OVS_VPORT_TYPE_SRV6:
+    case OVS_VPORT_TYPE_ESP:
     case OVS_VPORT_TYPE_UNSPEC:
     case __OVS_VPORT_TYPE_MAX:
     default:
@@ -316,6 +317,7 @@ dpif_netlink_rtnl_verify(const struct netdev_tunnel_config *tnl_cfg,
     case OVS_VPORT_TYPE_INTERNAL:
     case OVS_VPORT_TYPE_GTPU:
     case OVS_VPORT_TYPE_SRV6:
+    case OVS_VPORT_TYPE_ESP:
     case OVS_VPORT_TYPE_UNSPEC:
     case __OVS_VPORT_TYPE_MAX:
     default:
@@ -407,6 +409,7 @@ dpif_netlink_rtnl_create(const struct netdev_tunnel_config *tnl_cfg,
     case OVS_VPORT_TYPE_INTERNAL:
     case OVS_VPORT_TYPE_GTPU:
     case OVS_VPORT_TYPE_SRV6:
+    case OVS_VPORT_TYPE_ESP:
     case OVS_VPORT_TYPE_UNSPEC:
     case __OVS_VPORT_TYPE_MAX:
     default:
@@ -521,6 +524,7 @@ dpif_netlink_rtnl_tunnel_destroy(const char *name, const char *type)
     case OVS_VPORT_TYPE_INTERNAL:
     case OVS_VPORT_TYPE_GTPU:
     case OVS_VPORT_TYPE_SRV6:
+    case OVS_VPORT_TYPE_ESP:
     case OVS_VPORT_TYPE_UNSPEC:
     case __OVS_VPORT_TYPE_MAX:
     default:
