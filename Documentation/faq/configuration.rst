@@ -301,9 +301,6 @@ Q: Does the userspace datapath, for example with DPDK, support IPsec?
       must leave room for up to 57 bytes of overhead with an IPv4 underlay
       and 77 with IPv6.
 
-    * With userspace TSO enabled, packets that need TCP segmentation are
-      dropped.
-
 Q: How do I connect two bridges?
 
     A: First, why do you want to do this?  Two connected bridges are not much
