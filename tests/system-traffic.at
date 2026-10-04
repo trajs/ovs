@@ -1703,10 +1703,11 @@ NS_CHECK_EXEC([at_ns1], [ping -q -c 3 -i 0.3 -W 2 10.100.100.100 | FORMAT_PING],
 OVS_TRAFFIC_VSWITCHD_STOP
 AT_CLEANUP
 
-# ESP_TUNNEL_TEST([esp-options], [xfrm-state-options])
+# ESP_TUNNEL_TEST([esp-options], [xfrm-state-options], [ns-setup])
 #
 # Checks IPv4 and IPv6 traffic through an ESP tunnel between OVS and the
-# kernel's IPsec implementation in the namespace 'at_ns0'.
+# kernel's IPsec implementation in the namespace 'at_ns0'.  'ns-setup' runs
+# after the kernel's security associations and policies are configured.
 m4_define([ESP_TUNNEL_TEST], [
 OVS_CHECK_ESP()
 OVS_TRAFFIC_VSWITCHD_START()
@@ -1757,6 +1758,7 @@ for inner in "10.1.1.1/32 10.1.1.100/32" "fd00::1/128 fd00::100/128"; do
     NS_CHECK_EXEC([at_ns0], [ip xfrm policy add src $[]2 dst $[]1 dir in dnl
                     tmpl src 172.31.1.100 dst 172.31.1.1 proto esp mode tunnel])
 done
+$3
 
 dnl First, check the underlay.
 NS_CHECK_EXEC([at_ns0], [ping -q -c 3 -i 0.3 -W 2 172.31.1.100 | FORMAT_PING], [0], [dnl
@@ -1789,6 +1791,24 @@ AT_CLEANUP
 
 AT_SETUP([datapath - ping over esp tunnel with extended sequence numbers])
 ESP_TUNNEL_TEST([options:esp_esn=true], [flag esn replay-window 64])
+AT_CLEANUP
+
+AT_SETUP([datapath - ping over esp tunnel in udp])
+dnl The kernel only decapsulates ESP in UDP received on a socket that has the
+dnl UDP_ENCAP_ESPINUDP option, which an IKE daemon would usually open.
+AT_DATA([espinudp.py], [import socket
+import time
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("0.0.0.0", 4500))
+s.setsockopt(socket.IPPROTO_UDP, 100, 2)  # UDP_ENCAP, UDP_ENCAP_ESPINUDP
+time.sleep(3600)
+])
+ESP_TUNNEL_TEST([options:esp_udp_encap=true],
+                [encap espinudp 4500 4500 0.0.0.0 replay-window 64],
+                [NETNS_DAEMONIZE([at_ns0], [python3 espinudp.py],
+                                 [espinudp.pid])
+                 OVS_WAIT_UNTIL([ip netns exec at_ns0 ss -uln | grep -q :4500])])
 AT_CLEANUP
 
 AT_SETUP([datapath - ping6 over srv6 tunnel])
