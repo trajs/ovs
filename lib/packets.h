@@ -878,8 +878,8 @@ BUILD_ASSERT_DECL(UDP_HEADER_LEN == sizeof(struct udp_header));
 
 #define ESP_HEADER_LEN 8
 struct esp_header {
-    ovs_be32 spi;
-    ovs_be32 seq_no;
+    ovs_16aligned_be32 spi;
+    ovs_16aligned_be32 seq_no;
 };
 BUILD_ASSERT_DECL(ESP_HEADER_LEN == sizeof(struct esp_header));
 
