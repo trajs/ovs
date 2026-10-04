@@ -340,11 +340,14 @@ struct netdev_class {
      *
      * The 'ingress_netdev' points to the original ingress netdev for the
      * 'packet'.  This variable is valid only if hardware offload is enabled;
-     * otherwise, it will be NULL. */
-    void (*push_header)(const struct netdev *netdev,
-                        const struct netdev *ingress_netdev,
-                        struct dp_packet *packet,
-                        const struct ovs_action_push_tnl *data);
+     * otherwise, it will be NULL.
+     *
+     * Returns 0 if successful, otherwise a positive errno value.  On failure
+     * the caller drops 'packet'. */
+    int (*push_header)(const struct netdev *netdev,
+                       const struct netdev *ingress_netdev,
+                       struct dp_packet *packet,
+                       const struct ovs_action_push_tnl *data);
 
     /* Pop tunnel header from packet, build tunnel metadata and resize packet
      * for further processing.
