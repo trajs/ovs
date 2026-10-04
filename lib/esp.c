@@ -57,6 +57,17 @@ struct esp_sa {
     atomic_uint64_t seq;            /* Last sequence number sent. */
     uint64_t iv_salt;
 
+    /* Statistics, of sent packets for an outbound SA and of received ones
+     * for an inbound SA.  'n_bytes' counts the bytes of the payload, that is
+     * of the inner packets. */
+    atomic_uint64_t n_packets;
+    atomic_uint64_t n_bytes;
+    atomic_uint64_t n_replayed;     /* Inbound: dropped as replays. */
+    atomic_uint64_t n_auth_failed;  /* Inbound: failed authentication. */
+    atomic_uint64_t n_malformed;    /* Inbound: bad padding or length. */
+    atomic_uint64_t n_tx_errors;    /* Outbound: sequence exhausted or
+                                     * encryption failed. */
+
     /* Inbound anti-replay window (RFC 4303 section 3.4.3 and appendix A).
      * Bit (N % replay_size) of 'replay_bitmap' is set if sequence number N
      * has been received, for N in (replay_top - replay_size, replay_top]. */
@@ -172,6 +183,12 @@ esp_sa_create(const struct esp_sa_params *params OVS_UNUSED_WITHOUT_OPENSSL)
     atomic_add_relaxed(&next_id, 1, &sa->id);
     sa->cipher = cipher;
     atomic_init(&sa->seq, 0);
+    atomic_init(&sa->n_packets, 0);
+    atomic_init(&sa->n_bytes, 0);
+    atomic_init(&sa->n_replayed, 0);
+    atomic_init(&sa->n_auth_failed, 0);
+    atomic_init(&sa->n_malformed, 0);
+    atomic_init(&sa->n_tx_errors, 0);
     sa->iv_salt = random_uint64();
 
     ovs_mutex_init(&sa->replay_mutex);
@@ -212,6 +229,61 @@ const struct esp_sa_params *
 esp_sa_get_params(const struct esp_sa *sa)
 {
     return &sa->params;
+}
+
+#ifdef HAVE_OPENSSL
+static void
+esp_stat_inc(atomic_uint64_t *counter, uint64_t n)
+{
+    uint64_t orig;
+
+    atomic_add_relaxed(counter, n, &orig);
+}
+#endif
+
+static uint64_t
+esp_stat_read(const atomic_uint64_t *counter_)
+{
+    atomic_uint64_t *counter = CONST_CAST(atomic_uint64_t *, counter_);
+    uint64_t value;
+
+    atomic_read_relaxed(counter, &value);
+    return value;
+}
+
+/* Stores a snapshot of the statistics of 'sa' in 'stats'. */
+void
+esp_sa_get_stats(const struct esp_sa *sa_, struct esp_sa_stats *stats)
+{
+    struct esp_sa *sa = CONST_CAST(struct esp_sa *, sa_);
+
+    stats->n_packets = esp_stat_read(&sa->n_packets);
+    stats->n_bytes = esp_stat_read(&sa->n_bytes);
+    stats->n_replayed = esp_stat_read(&sa->n_replayed);
+    stats->n_auth_failed = esp_stat_read(&sa->n_auth_failed);
+    stats->n_malformed = esp_stat_read(&sa->n_malformed);
+    stats->n_tx_errors = esp_stat_read(&sa->n_tx_errors);
+    stats->tx_seq = esp_stat_read(&sa->seq);
+
+    ovs_mutex_lock(&sa->replay_mutex);
+    stats->rx_seq = sa->replay_top;
+    ovs_mutex_unlock(&sa->replay_mutex);
+}
+
+/* Returns the name of the cipher of 'sa', e.g. "aes128-gcm16". */
+const char *
+esp_sa_cipher_name(const struct esp_sa *sa)
+{
+    switch (sa->params.key_len - ESP_SALT_LEN) {
+    case 16:
+        return "aes128-gcm16";
+    case 24:
+        return "aes192-gcm16";
+    case 32:
+        return "aes256-gcm16";
+    default:
+        return "unknown";
+    }
 }
 
 /* Makes the next packet sent on outbound SA 'sa' use sequence number 'seq'.
@@ -550,6 +622,7 @@ esp_seal(struct esp_sa *sa OVS_UNUSED_WITHOUT_OPENSSL,
     if (OVS_UNLIKELY(sa->params.esn ? !seq : seq > UINT32_MAX)) {
         /* RFC 4303 section 3.3.3: the sequence number must not cycle. */
         COVERAGE_INC(esp_tx_seq_exhausted);
+        esp_stat_inc(&sa->n_tx_errors, 1);
         return ERANGE;
     }
 
@@ -576,8 +649,12 @@ esp_seal(struct esp_sa *sa OVS_UNUSED_WITHOUT_OPENSSL,
                                              ESP_ICV_LEN,
                                              payload + ct_len))) {
         COVERAGE_INC(esp_tx_crypto_error);
+        esp_stat_inc(&sa->n_tx_errors, 1);
         return EIO;
     }
+
+    esp_stat_inc(&sa->n_packets, 1);
+    esp_stat_inc(&sa->n_bytes, payload_len);
     return 0;
 #else
     return EOPNOTSUPP;
@@ -630,6 +707,7 @@ esp_open(struct esp_header *esp OVS_UNUSED_WITHOUT_OPENSSL,
     seq_lo = ntohl(get_16aligned_be32(&esp->seq_no));
     if (OVS_UNLIKELY(!esp_replay_check(sa, seq_lo, &seq))) {
         COVERAGE_INC(esp_rx_replay);
+        esp_stat_inc(&sa->n_replayed, 1);
         return EALREADY;
     }
 
@@ -646,32 +724,39 @@ esp_open(struct esp_header *esp OVS_UNUSED_WITHOUT_OPENSSL,
                      || EVP_CipherFinal_ex(ctx, payload + out_len,
                                            &out_len) <= 0)) {
         COVERAGE_INC(esp_rx_auth_failed);
+        esp_stat_inc(&sa->n_auth_failed, 1);
         return EBADMSG;
     }
 
     if (OVS_UNLIKELY(!esp_replay_update(sa, seq))) {
         COVERAGE_INC(esp_rx_replay);
+        esp_stat_inc(&sa->n_replayed, 1);
         return EALREADY;
     }
 
     trailer = payload + ct_len - ESP_TRAILER_LEN;
     pad_len = trailer[0];
     if (OVS_UNLIKELY(pad_len + ESP_TRAILER_LEN > ct_len)) {
-        COVERAGE_INC(esp_rx_malformed);
-        return EINVAL;
+        goto malformed;
     }
     /* RFC 4303 section 2.4: the padding bytes are 1, 2, 3, ... */
     pad = trailer - pad_len;
     for (size_t i = 0; i < pad_len; i++) {
         if (OVS_UNLIKELY(pad[i] != i + 1)) {
-            COVERAGE_INC(esp_rx_malformed);
-            return EINVAL;
+            goto malformed;
         }
     }
 
     *next_hdr = trailer[1];
     *payload_len = ct_len - pad_len - ESP_TRAILER_LEN;
+    esp_stat_inc(&sa->n_packets, 1);
+    esp_stat_inc(&sa->n_bytes, *payload_len);
     return 0;
+
+malformed:
+    COVERAGE_INC(esp_rx_malformed);
+    esp_stat_inc(&sa->n_malformed, 1);
+    return EINVAL;
 #else
     return EOPNOTSUPP;
 #endif

@@ -1702,6 +1702,24 @@ AT_CHECK([ovs-appctl coverage/read-counter esp_rx_replay], [0], [1
 AT_CHECK([ovs-appctl coverage/read-counter esp_rx_auth_failed], [0], [1
 ])
 
+dnl Per-SA statistics.  The inner packets are 92 bytes long when sent and 40
+dnl bytes long when received.
+AT_CHECK([ovs-appctl esp/show], [0], [dnl
+t1: remote 1.1.2.92
+  outbound: spi 0x00002000, aes128-gcm16, esn off
+    packets 2, bytes 184, last seq 2, errors 0
+  inbound : spi 0x00001000, aes128-gcm16, esn off, replay window 64
+    packets 2, bytes 80, highest seq 2
+    replayed 1, auth failed 1, malformed 0
+])
+AT_CHECK([ovs-appctl esp/show t1 | head -1], [0], [dnl
+t1: remote 1.1.2.92
+])
+AT_CHECK([ovs-appctl esp/show nonexistent], [2], [], [dnl
+no such esp tunnel
+ovs-appctl: ovs-vswitchd: server returned an error
+])
+
 dnl Datapath flows for both directions.  The tunnel ID of received packets
 dnl is the SPI.  The first packet of each flow was an upcall.
 AT_CHECK([ovs-appctl dpctl/dump-flows | strip_used | sort | dnl

@@ -77,6 +77,20 @@ struct esp_sa *esp_sa_create(const struct esp_sa_params *);
 void esp_sa_destroy(struct esp_sa *);
 void esp_sa_destroy_postponed(struct esp_sa *);
 const struct esp_sa_params *esp_sa_get_params(const struct esp_sa *);
+const char *esp_sa_cipher_name(const struct esp_sa *);
+
+struct esp_sa_stats {
+    uint64_t n_packets;         /* Sent (outbound) or received (inbound). */
+    uint64_t n_bytes;           /* Of the inner packets. */
+    uint64_t n_replayed;        /* Inbound only. */
+    uint64_t n_auth_failed;     /* Inbound only. */
+    uint64_t n_malformed;       /* Inbound only. */
+    uint64_t n_tx_errors;       /* Outbound only. */
+    uint64_t tx_seq;            /* Outbound: last sequence number sent. */
+    uint64_t rx_seq;            /* Inbound: highest sequence number received,
+                                 * if the anti-replay window is enabled. */
+};
+void esp_sa_get_stats(const struct esp_sa *, struct esp_sa_stats *);
 
 int esp_sad_insert(struct esp_sa *);
 void esp_sad_replace(struct esp_sa *old, struct esp_sa *new);

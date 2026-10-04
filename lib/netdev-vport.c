@@ -800,6 +800,91 @@ esp_tunnel_install_sa(struct esp_sa **cur, struct esp_sa *new)
     esp_sa_destroy_postponed(old);
 }
 
+static void
+esp_show_sa(struct ds *ds, const char *dir, const struct esp_sa *sa,
+            bool inbound)
+{
+    const struct esp_sa_params *p = esp_sa_get_params(sa);
+    struct esp_sa_stats stats;
+
+    esp_sa_get_stats(sa, &stats);
+    ds_put_format(ds, "  %s: spi 0x%08"PRIx32", %s, esn %s", dir,
+                  ntohl(p->spi), esp_sa_cipher_name(sa),
+                  p->esn ? "on" : "off");
+    if (inbound) {
+        ds_put_format(ds, ", replay window %"PRIu16"\n", p->replay_window);
+        ds_put_format(ds, "    packets %"PRIu64", bytes %"PRIu64,
+                      stats.n_packets, stats.n_bytes);
+        if (p->replay_window) {
+            ds_put_format(ds, ", highest seq %"PRIu64, stats.rx_seq);
+        }
+        ds_put_format(ds, "\n    replayed %"PRIu64", auth failed %"PRIu64
+                      ", malformed %"PRIu64"\n", stats.n_replayed,
+                      stats.n_auth_failed, stats.n_malformed);
+    } else {
+        ds_put_format(ds, "\n    packets %"PRIu64", bytes %"PRIu64
+                      ", last seq %"PRIu64", errors %"PRIu64"\n",
+                      stats.n_packets, stats.n_bytes, stats.tx_seq,
+                      stats.n_tx_errors);
+    }
+}
+
+static int
+compare_netdev_names(const void *a_, const void *b_)
+{
+    const struct netdev *const *a = a_;
+    const struct netdev *const *b = b_;
+
+    return strcmp(netdev_get_name(*a), netdev_get_name(*b));
+}
+
+static void
+netdev_vport_esp_show(struct unixctl_conn *conn, int argc,
+                      const char *argv[], void *aux OVS_UNUSED)
+{
+    struct ds ds = DS_EMPTY_INITIALIZER;
+    struct netdev **vports;
+    size_t n_vports;
+    bool found = false;
+
+    vports = netdev_get_vports(&n_vports);
+    qsort(vports, n_vports, sizeof *vports, compare_netdev_names);
+    for (size_t i = 0; i < n_vports; i++) {
+        struct netdev_vport *dev = netdev_vport_cast(vports[i]);
+        const char *name = netdev_get_name(vports[i]);
+
+        if (strcmp(netdev_get_type(vports[i]), "esp")
+            || (argc > 1 && strcmp(argv[1], name))) {
+            continue;
+        }
+
+        ovs_mutex_lock(&dev->mutex);
+        if (dev->esp_in_sa && dev->esp_out_sa) {
+            const struct netdev_tunnel_config *tnl_cfg;
+
+            tnl_cfg = vport_tunnel_config(dev);
+            ds_put_format(&ds, "%s: remote ", name);
+            ipv6_format_mapped(&tnl_cfg->ipv6_dst, &ds);
+            ds_put_char(&ds, '\n');
+            esp_show_sa(&ds, "outbound", dev->esp_out_sa, false);
+            esp_show_sa(&ds, "inbound ", dev->esp_in_sa, true);
+            found = true;
+        }
+        ovs_mutex_unlock(&dev->mutex);
+    }
+    for (size_t i = 0; i < n_vports; i++) {
+        netdev_close(vports[i]);
+    }
+    free(vports);
+
+    if (argc > 1 && !found) {
+        unixctl_command_reply_error(conn, "no such esp tunnel");
+    } else {
+        unixctl_command_reply(conn, ds_cstr(&ds));
+    }
+    ds_destroy(&ds);
+}
+
 static int
 set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
 {
@@ -1613,6 +1698,8 @@ netdev_vport_tunnel_register(void)
 
         unixctl_command_register("tnl/egress_port_range", "min max", 0, 2,
                                  netdev_tnl_egress_port_range, NULL);
+        unixctl_command_register("esp/show", "[port]", 0, 1,
+                                 netdev_vport_esp_show, NULL);
 
         ovsthread_once_done(&once);
     }
