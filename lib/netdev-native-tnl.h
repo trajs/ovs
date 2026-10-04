@@ -33,7 +33,7 @@ netdev_gre_build_header(const struct netdev *netdev,
                         struct ovs_action_push_tnl *data,
                         const struct netdev_tnl_build_header_params *params);
 
-void
+int
 netdev_gre_push_header(const struct netdev *netdev,
                        const struct netdev *ingress_netdev,
                        struct dp_packet *packet,
@@ -46,7 +46,7 @@ netdev_erspan_build_header(const struct netdev *netdev,
                            struct ovs_action_push_tnl *data,
                            const struct netdev_tnl_build_header_params *p);
 
-void
+int
 netdev_erspan_push_header(const struct netdev *netdev,
                           const struct netdev *ingress_netdev,
                           struct dp_packet *packet,
@@ -57,7 +57,7 @@ netdev_erspan_pop_header(struct dp_packet *packet);
 struct dp_packet *
 netdev_gtpu_pop_header(struct dp_packet *packet);
 
-void
+int
 netdev_gtpu_push_header(const struct netdev *netdev,
                         const struct netdev *ingress_netdev,
                         struct dp_packet *packet,
@@ -70,7 +70,7 @@ netdev_gtpu_build_header(const struct netdev *netdev,
 
 struct dp_packet *netdev_srv6_pop_header(struct dp_packet *);
 
-void netdev_srv6_push_header(const struct netdev *,
+int netdev_srv6_push_header(const struct netdev *,
                              const struct netdev *ingress_netdev,
                              struct dp_packet *,
                              const struct ovs_action_push_tnl *);
@@ -79,7 +79,7 @@ int netdev_srv6_build_header(const struct netdev *,
                              struct ovs_action_push_tnl *,
                              const struct netdev_tnl_build_header_params *);
 
-void
+int
 netdev_tnl_push_udp_header(const struct netdev *netdev,
                            const struct netdev *ingress_netdev,
                            struct dp_packet *packet,

@@ -300,7 +300,7 @@ tnl_ol_pop(struct dp_packet *packet, int off)
     dp_packet_reset_packet(packet, off);
 }
 
-void
+int
 netdev_tnl_push_udp_header(const struct netdev *netdev OVS_UNUSED,
                            const struct netdev *ingress_netdev,
                            struct dp_packet *packet,
@@ -339,6 +339,8 @@ netdev_tnl_push_udp_header(const struct netdev *netdev OVS_UNUSED,
     if (l4_ofs != UINT16_MAX) {
         packet->inner_l4_ofs = l4_ofs + data->header_len;
     }
+
+    return 0;
 }
 
 static void *
@@ -535,7 +537,7 @@ err:
     return NULL;
 }
 
-void
+int
 netdev_gre_push_header(const struct netdev *netdev,
                        const struct netdev *ingress_netdev OVS_UNUSED,
                        struct dp_packet *packet,
@@ -577,6 +579,8 @@ netdev_gre_push_header(const struct netdev *netdev,
     if (l4_ofs != UINT16_MAX) {
         packet->inner_l4_ofs = l4_ofs + data->header_len;
     }
+
+    return 0;
 }
 
 int
@@ -699,7 +703,7 @@ err:
     return NULL;
 }
 
-void
+int
 netdev_erspan_push_header(const struct netdev *netdev,
                           const struct netdev *ingress_netdev OVS_UNUSED,
                           struct dp_packet *packet,
@@ -724,6 +728,8 @@ netdev_erspan_push_header(const struct netdev *netdev,
         md2 = ALIGNED_CAST(struct erspan_md2 *, ersh + 1);
         put_16aligned_be32(&md2->timestamp, get_erspan_ts(ERSPAN_100US));
     }
+
+    return 0;
 }
 
 int
@@ -873,7 +879,7 @@ err:
     return NULL;
 }
 
-void
+int
 netdev_gtpu_push_header(const struct netdev *netdev,
                         const struct netdev *ingress_netdev OVS_UNUSED,
                         struct dp_packet *packet,
@@ -907,6 +913,8 @@ netdev_gtpu_push_header(const struct netdev *netdev,
         payload_len += sizeof(struct gtpuhdr_opt);
     }
     gtpuh->len = htons(payload_len);
+
+    return 0;
 }
 
 int
@@ -1007,7 +1015,7 @@ netdev_srv6_build_header(const struct netdev *netdev,
     return 0;
 }
 
-void
+int
 netdev_srv6_push_header(const struct netdev *netdev OVS_UNUSED,
                         const struct netdev *ingress_netdev OVS_UNUSED,
                         struct dp_packet *packet,
@@ -1041,6 +1049,8 @@ netdev_srv6_push_header(const struct netdev *netdev OVS_UNUSED,
 
     netdev_tnl_push_ip_header(packet, data->header,
                               data->header_len, &ip_tot_size, ipv6_label);
+
+    return 0;
 }
 
 struct dp_packet *

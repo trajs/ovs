@@ -916,12 +916,11 @@ netdev_push_header(const struct netdev *netdev,
                               || (data->tnl_type == OVS_VPORT_TYPE_VXLAN)
                               || (data->tnl_type == OVS_VPORT_TYPE_GRE)
                               || (data->tnl_type == OVS_VPORT_TYPE_IP6GRE);
+    size_t i, size = dp_packet_batch_size(batch);
     struct dp_packet *packet;
 
     if (userspace_tso_enabled()) {
         if (OVS_UNLIKELY(!supported_offloads)) {
-            size_t i, size = dp_packet_batch_size(batch);
-
             DP_PACKET_BATCH_REFILL_FOR_EACH (i, size, packet, batch) {
                 if (OVS_UNLIKELY(dp_packet_get_tso_segsz(packet))) {
                     COVERAGE_INC(netdev_push_header_drops);
@@ -935,7 +934,7 @@ netdev_push_header(const struct netdev *netdev,
                 dp_packet_batch_add(batch, packet);
             }
         } else {
-            DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
+            DP_PACKET_BATCH_FOR_EACH (j, packet, batch) {
                 if (dp_packet_tunnel(packet)
                     && dp_packet_get_tso_segsz(packet)) {
                     dp_packet_gso_batch(batch);
@@ -945,13 +944,20 @@ netdev_push_header(const struct netdev *netdev,
         }
     }
 
-    DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
+    size = dp_packet_batch_size(batch);
+    DP_PACKET_BATCH_REFILL_FOR_EACH (i, size, packet, batch) {
         if (!supported_offloads || dp_packet_tunnel(packet)) {
             dp_packet_ol_send_prepare(packet, 0);
         }
-        netdev->netdev_class->push_header(netdev, ingress_netdev, packet,
-                                          data);
+        if (OVS_UNLIKELY(netdev->netdev_class->push_header(netdev,
+                                                           ingress_netdev,
+                                                           packet, data))) {
+            COVERAGE_INC(netdev_push_header_drops);
+            dp_packet_delete(packet);
+            continue;
+        }
         pkt_metadata_init(&packet->md, data->out_port);
+        dp_packet_batch_add(batch, packet);
     }
 
     return 0;
