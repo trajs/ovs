@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "conntrack.h"
+#include "conntrack-log.h"
 #include "conntrack-private.h"
 #include "conntrack-tp.h"
 #include "coverage.h"
@@ -253,6 +254,7 @@ conntrack_init(void)
      * set it first to ensure it is available.
      */
     ct->hash_basis = random_uint32();
+    conntrack_log_init();
 
     ovs_rwlock_init(&ct->resources_lock);
     ovs_rwlock_wrlock(&ct->resources_lock);
@@ -581,11 +583,18 @@ conn_clean__(struct conntrack *ct, struct conn *conn)
 /* Also removes the associated nat 'conn' from the lookup
    datastructures. */
 static void
-conn_clean(struct conntrack *ct, struct conn *conn)
+conn_clean(struct conntrack *ct, struct conn *conn,
+           enum ct_log_reason reason)
     OVS_EXCLUDED(conn->lock, ct->ct_lock)
 {
     if (atomic_flag_test_and_set(&conn->reclaimed)) {
         return;
+    }
+
+    if (reason != CT_LOG_R_SHUTDOWN
+        && conntrack_log_enabled(CT_LOG_DESTROY,
+                                    conn->key_node[CT_DIR_FWD].key.zone)) {
+        conntrack_log_conn(CT_LOG_DESTROY, reason, conn);
     }
 
     ovs_mutex_lock(&ct->ct_lock);
@@ -621,7 +630,7 @@ conntrack_destroy(struct conntrack *ct)
 
     for (unsigned i = 0; i < N_EXP_LISTS; i++) {
         RCULIST_FOR_EACH (conn, node, &ct->exp_lists[i]) {
-            conn_clean(ct, conn);
+            conn_clean(ct, conn, CT_LOG_R_SHUTDOWN);
         }
     }
 
@@ -1064,6 +1073,7 @@ conn_not_found(struct conntrack *ct, struct dp_packet *pkt,
         }
 
         nc = new_conn(ct, pkt, &ctx->key, now, tp_id);
+        nc->created = now;
         fwd_key_node = &nc->key_node[CT_DIR_FWD];
         rev_key_node = &nc->key_node[CT_DIR_REV];
         memcpy(&fwd_key_node->key, &ctx->key, sizeof fwd_key_node->key);
@@ -1440,12 +1450,22 @@ process_one(struct conntrack *ct, struct dp_packet *pkt,
         }
         ovs_rwlock_unlock(&ct->resources_lock);
 
+        struct conn *nc = NULL;
+
         ovs_mutex_lock(&ct->ct_lock);
         if (!conn_lookup(ct, &ctx->key, now, NULL, NULL)) {
-            conn = conn_not_found(ct, pkt, ctx, commit, now, nat_action_info,
-                                  helper, alg_exp, ct_alg_ctl, tp_id);
+            nc = conn_not_found(ct, pkt, ctx, commit, now, nat_action_info,
+                                helper, alg_exp, ct_alg_ctl, tp_id);
+            conn = nc;
         }
         ovs_mutex_unlock(&ct->ct_lock);
+
+        /* Logged outside of 'ct_lock' to keep the critical section short.
+         * The connection cannot be freed under us: reclamation is deferred
+         * with ovsrcu_postpone() and this thread is not quiescent. */
+        if (nc && conntrack_log_enabled(CT_LOG_NEW, ctx->key.zone)) {
+            conntrack_log_conn(CT_LOG_NEW, CT_LOG_R_NONE, nc);
+        }
     }
 
     write_ct_md(pkt, zone, conn, &ctx->key, alg_exp);
@@ -1597,7 +1617,7 @@ ct_sweep(struct conntrack *ct, struct rculist *list, long long now,
 
     RCULIST_FOR_EACH (conn, node, list) {
         if (conn_expired(conn, now)) {
-            conn_clean(ct, conn);
+            conn_clean(ct, conn, CT_LOG_R_EXPIRED);
             cleaned++;
         }
 
@@ -2991,7 +3011,7 @@ conntrack_flush_zone(struct conntrack *ct, const uint16_t zone)
             continue;
         }
         conn = CONTAINER_OF(keyn, struct conn, key_node[CT_DIR_FWD]);
-        conn_clean(ct, conn);
+        conn_clean(ct, conn, CT_LOG_R_FLUSHED);
     }
 
     return 0;
@@ -3024,7 +3044,7 @@ conntrack_flush_tuple(struct conntrack *ct, const struct ct_dpif_tuple *tuple,
     conn_lookup(ct, &key, time_msec(), &conn, NULL);
 
     if (conn) {
-        conn_clean(ct, conn);
+        conn_clean(ct, conn, CT_LOG_R_FLUSHED);
     } else {
         VLOG_WARN("Tuple not found");
         error = ENOENT;

@@ -1,5 +1,12 @@
 Post-v4.0.0
 --------------------
+   - Userspace datapath:
+     * Added optional logging of connection tracking NEW and DESTROY events.
+       Events are queued to a lock-free ring buffer by the datapath threads
+       and formatted and written by a dedicated 'ct_log' thread under the
+       'conntrack_log' vlog module.  Enable with
+       'ovs-appctl conntrack/log-set events=new,destroy [zones=LIST] [rate=N]'.
+       Logging can be limited to some conntrack zones.
 
 
 v4.0.0 - 17 Aug 2026

@@ -156,6 +156,9 @@ struct conn {
     bool alg_related; /* True if alg data connection. */
 
     uint32_t tp_id; /* Timeout policy ID. */
+
+    long long created; /* Creation time, in 'time_msec()' units.  Immutable
+                        * once the connection is inserted. */
 };
 
 enum ct_update_res {

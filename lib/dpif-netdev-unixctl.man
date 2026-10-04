@@ -228,3 +228,20 @@ recirculation (only in balance-tcp mode).
 When this is the case, the above command prints the load-balancing information
 of the bonds configured in datapath \fIdp\fR showing the interface associated
 with each bucket (hash).
+.
+.IP "\fBconntrack/log-set\fR [\fBevents=\fIlist\fR] [\fBzones=\fIlist\fR] [\fBrate=\fIN\fR]"
+Configures logging of userspace connection tracking events.  \fIlist\fR is a
+comma-separated list of \fBnew\fR, \fBdestroy\fR, \fBall\fR or \fBnone\fR
+(the default is \fBnone\fR, which disables logging).  \fBzones\fR limits
+logging to connections in the given conntrack zones, as a comma-separated list
+of zone numbers and ranges such as \fB1,5,10\-20\fR, or \fBall\fR (the
+default).  Events are copied by
+the datapath threads into a lock-free ring buffer and formatted and written
+by a separate thread under the \fBconntrack_log\fR vlog module at \fBinfo\fR
+level.  If the ring is full, or more than \fIN\fR events per second (default
+1000, 0 for unlimited) are queued, events are dropped and counted by the
+\fBconntrack_log_dropped\fR and \fBconntrack_log_ratelimited\fR coverage
+counters, so that logging never slows down packet processing.
+.
+.IP "\fBconntrack/log-show\fR"
+Prints the current connection tracking logging configuration.
