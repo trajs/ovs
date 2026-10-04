@@ -229,6 +229,7 @@ test_round_trip(void)
 static void
 test_replay_window(void)
 {
+    struct esp_sa_stats stats;
     struct esp_sa_params params = make_params(0x3000, TEST_KEY, false, 64);
     struct esp_sa *out = esp_sa_create(&params);
     struct esp_sa *in = esp_sa_create(&params);
@@ -251,6 +252,8 @@ test_replay_window(void)
     ovs_assert(!send_seq(out, UINT32_MAX));
     struct test_pkt pkt;
     ovs_assert(seal(out, &pkt, "x", 1) == ERANGE);
+    esp_sa_get_stats(out, &stats);
+    ovs_assert(stats.tx_seq == UINT32_MAX);
 
     esp_sad_remove(in);
     esp_sa_destroy(in);

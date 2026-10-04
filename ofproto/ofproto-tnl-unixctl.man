@@ -77,3 +77,11 @@ If used without arguments, it prints the current aging value.
 Set range for UDP source port used for UDP based Tunnels. For
 example VxLAN. If case of zero arguments this command prints
 current range in use.
+.
+.IP "\fBesp/show\fR [\fIport\fR]"
+Shows the security associations of each \fBesp\fR tunnel port, or only
+of \fIport\fR, with their SPI, cipher and sequence number state, and
+the number of packets and bytes sent or received through each.  For
+inbound security associations, it also shows the number of packets
+dropped as replays, because they failed authentication, or because
+they were malformed.  The byte counts are of the inner packets.
