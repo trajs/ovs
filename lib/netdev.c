@@ -920,7 +920,16 @@ netdev_push_header(const struct netdev *netdev,
     struct dp_packet *packet;
 
     if (userspace_tso_enabled()) {
-        if (OVS_UNLIKELY(!supported_offloads)) {
+        if (data->tnl_type == OVS_VPORT_TYPE_ESP) {
+            /* Segmentation must happen before encryption, and no NIC can
+             * segment the encrypted packets, so segment them here. */
+            DP_PACKET_BATCH_FOR_EACH (j, packet, batch) {
+                if (dp_packet_get_tso_segsz(packet)) {
+                    dp_packet_gso_batch(batch);
+                    break;
+                }
+            }
+        } else if (OVS_UNLIKELY(!supported_offloads)) {
             DP_PACKET_BATCH_REFILL_FOR_EACH (i, size, packet, batch) {
                 if (OVS_UNLIKELY(dp_packet_get_tso_segsz(packet))) {
                     COVERAGE_INC(netdev_push_header_drops);
