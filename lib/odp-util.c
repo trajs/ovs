@@ -906,6 +906,19 @@ format_odp_tnl_push_header(struct ds *ds, struct ovs_action_push_tnl *data)
                       ntohl(get_16aligned_be32(&gtph->teid)));
     } else if (data->tnl_type == OVS_VPORT_TYPE_ESP) {
         const struct esp_header *esp = l4;
+        uint8_t nw_proto = (eth->eth_type == htons(ETH_TYPE_IP)
+                            ? ((const struct ip_header *) l3)->ip_proto
+                            : ((const struct ovs_16aligned_ip6_hdr *) l3)
+                              ->ip6_nxt);
+
+        if (nw_proto == IPPROTO_UDP) {
+            /* ESP in UDP, for NAT traversal. */
+            esp = format_udp_tnl_push_header(ds, udp, bytes_left);
+            if (!esp) {
+                return;
+            }
+            bytes_left -= sizeof *udp;
+        }
 
         if (bytes_left < sizeof *esp) {
             ds_put_cstr(ds, "esp(truncated header))");
@@ -1855,6 +1868,15 @@ ovs_parse_tnl_push(const char *s, struct ovs_action_push_tnl *data)
             gnh->proto_type = htons(ETH_TYPE_TEB);
             put_16aligned_be32(&gnh->vni, htonl(vni << 8));
             tnl_type = OVS_VPORT_TYPE_GENEVE;
+        } else if (ovs_scan_len(s, &n, "esp(spi=0x%"SCNx32"))", &spi)) {
+            /* ESP in UDP, for NAT traversal. */
+            struct esp_header *esp = (struct esp_header *) (udp + 1);
+
+            put_16aligned_be32(&esp->spi, htonl(spi));
+            put_16aligned_be32(&esp->seq_no, 0);
+            memset(esp + 1, 0, ESP_IV_LEN);
+            tnl_type = OVS_VPORT_TYPE_ESP;
+            header_len = sizeof *eth + ip_len + sizeof *udp + ESP_PREFIX_LEN;
         } else {
             return -EINVAL;
         }
