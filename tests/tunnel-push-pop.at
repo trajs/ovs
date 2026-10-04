@@ -1732,3 +1732,54 @@ recirc_id(X),tunnel(tun_id=0x1000,src=1.1.2.92,dst=1.1.2.88,flags(+key)),in_port
 
 OVS_VSWITCHD_STOP
 AT_CLEANUP
+
+AT_SETUP([tunnel_push_pop - esp with userspace TSO])
+AT_KEYWORDS([ipsec userspace offload])
+AT_SKIP_IF([test "$HAVE_OPENSSL" = no])
+
+dnl ESP packets cannot be segmented after encryption, so TCP segmentation
+dnl must happen in software before.
+OVS_VSWITCHD_START([set Open_vSwitch . other_config:userspace-tso-enable=true dnl
+                    -- add-port br0 p0 -- set Interface p0 type=dummy dnl
+                    ofport_request=1 other-config:hwaddr=aa:55:aa:55:00:00 dnl
+                    options:tx_pcap=p0.pcap])
+AT_CHECK([ovs-vsctl add-br int-br -- set bridge int-br datapath_type=dummy])
+AT_CHECK([ovs-vsctl add-port int-br t1 -- set Interface t1 type=esp dnl
+            ofport_request=2 options:remote_ip=1.1.2.92 dnl
+            options:esp_in_spi=4096 options:esp_out_spi=8192 dnl
+            options:esp_in_key=0x101112131415161718191a1b1c1d1e1fcafebabe dnl
+            options:esp_out_key=0x202122232425262728292a2b2c2d2e2fdeadbeef dnl
+            -- add-port int-br p1 -- set Interface p1 type=dummy dnl
+            ofport_request=3 options:ol_tso_segsz=500])
+
+AT_CHECK([ovs-appctl netdev-dummy/ip4addr br0 1.1.2.88/24], [0], [OK
+])
+AT_CHECK([ovs-appctl tnl/neigh/set br0 1.1.2.92 aa:55:aa:55:00:01], [0], [OK
+])
+AT_CHECK([ovs-ofctl add-flow br0 action=normal])
+AT_CHECK([ovs-ofctl add-flow int-br in_port=p1,action=t1])
+
+dnl A TCP packet with 2000 bytes of payload becomes 4 segments of 500 bytes,
+dnl each encrypted separately.
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 dnl
+  'eth(src=f8:bc:12:44:34:b6,dst=aa:55:aa:55:00:00),eth_type(0x0800),ipv4(src=10.0.0.1,dst=10.0.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=54392,dst=5201),tcp_flags(ack)' dnl
+  --len 2054])
+OVS_WAIT_UNTIL([test $(ovs-pcap p0.pcap | wc -l) -ge 4])
+
+dnl Each 540-byte segment becomes 16 + 540 + 2 (padding) + 2 + 16 bytes of
+dnl ESP.  Only check the headers before the random IV.
+AT_CHECK([ovs-pcap p0.pcap | cut -c1-84], [0], [dnl
+aa55aa550001aa55aa5500000800450002540000400040323[]1c3010102580101025c0000200000000001
+aa55aa550001aa55aa5500000800450002540000400040323[]1c3010102580101025c0000200000000002
+aa55aa550001aa55aa5500000800450002540000400040323[]1c3010102580101025c0000200000000003
+aa55aa550001aa55aa5500000800450002540000400040323[]1c3010102580101025c0000200000000004
+])
+AT_CHECK([ovs-appctl esp/show t1 | sed -n 2,3p], [0], [dnl
+  outbound: spi 0x00002000, aes128-gcm16, esn off
+    packets 4, bytes 2160, last seq 4, errors 0
+])
+AT_CHECK([ovs-appctl coverage/read-counter netdev_push_header_drops], [0], [0
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP

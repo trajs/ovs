@@ -47,7 +47,8 @@ dp_packet_gso_seg_new(const struct dp_packet *p, size_t hdr_len,
     dp_packet_put(seg, dp_packet_data(p), hdr_len);
     dp_packet_put(seg, (char *) dp_packet_data(p) + data_off, data_len);
 
-    /* The new segment should have the same offsets. */
+    /* The new segment should have the same type and offsets. */
+    seg->packet_type = p->packet_type;
     seg->l2_5_ofs = p->l2_5_ofs;
     seg->l3_ofs = p->l3_ofs;
     seg->l4_ofs = p->l4_ofs;
@@ -207,11 +208,11 @@ dp_packet_gso__(struct dp_packet *p, struct dp_packet_batch *batch,
 
     if (dp_packet_tunnel(p)) {
         hdr_len = (char *) dp_packet_get_inner_tcp_payload(p)
-                  - (char *) dp_packet_eth(p);
+                  - (char *) dp_packet_data(p);
         data_len = dp_packet_get_inner_tcp_payload_length(p);
     } else {
         hdr_len = (char *) dp_packet_get_tcp_payload(p)
-                  - (char *) dp_packet_eth(p);
+                  - (char *) dp_packet_data(p);
         data_len = dp_packet_get_tcp_payload_length(p);
     }
 
