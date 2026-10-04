@@ -525,6 +525,13 @@ class ODPFlow(Flow):
                                             }
                                         )
                                     ),
+                                    "esp": nested_kv_decoder(
+                                        KVDecoders(
+                                            {
+                                                "spi": decode_int,
+                                            }
+                                        )
+                                    ),
                                 }
                             )
                         ),

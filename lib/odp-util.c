@@ -30,6 +30,7 @@
 #include "byte-order.h"
 #include "coverage.h"
 #include "dpif.h"
+#include "esp.h"
 #include "openvswitch/dynamic-string.h"
 #include "flow.h"
 #include "netlink.h"
@@ -903,6 +904,16 @@ format_odp_tnl_push_header(struct ds *ds, struct ovs_action_push_tnl *data)
                           ",msgtype=%"PRIu8",teid=0x%"PRIx32")",
                       gtph->md.flags, gtph->md.msgtype,
                       ntohl(get_16aligned_be32(&gtph->teid)));
+    } else if (data->tnl_type == OVS_VPORT_TYPE_ESP) {
+        const struct esp_header *esp = l4;
+
+        if (bytes_left < sizeof *esp) {
+            ds_put_cstr(ds, "esp(truncated header))");
+            return;
+        }
+
+        ds_put_format(ds, "esp(spi=0x%"PRIx32")",
+                      ntohl(get_16aligned_be32(&esp->spi)));
     }
 
     ds_put_format(ds, ")");
@@ -1716,6 +1727,7 @@ ovs_parse_tnl_push(const char *s, struct ovs_action_push_tnl *data)
     uint32_t teid;
     uint8_t gtpu_flags, gtpu_msgtype;
     uint8_t segments_left;
+    uint32_t spi;
 
     if (!ovs_scan_len(s, &n, "tnl_push(tnl_port(%"SCNi32"),", &data->tnl_port)) {
         return -EINVAL;
@@ -2008,6 +2020,15 @@ ovs_parse_tnl_push(const char *s, struct ovs_action_push_tnl *data)
         if (n_segs != segments_left + 1) {
             return -EINVAL;
         }
+    } else if (ovs_scan_len(s, &n, "esp(spi=0x%"SCNx32"))", &spi)) {
+        struct esp_header *esp = l4;
+
+        put_16aligned_be32(&esp->spi, htonl(spi));
+        put_16aligned_be32(&esp->seq_no, 0);
+        memset(esp + 1, 0, ESP_IV_LEN);
+
+        tnl_type = OVS_VPORT_TYPE_ESP;
+        header_len = sizeof *eth + ip_len + ESP_PREFIX_LEN;
     } else {
         return -EINVAL;
     }

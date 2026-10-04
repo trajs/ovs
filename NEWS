@@ -6,6 +6,10 @@ Post-v4.0.0
    - ovs-vswitchd:
      * Mirror filters now accept masked fields, e.g. "ip,nw_src=10.0.0.0/24"
        in the "filter" column of the Mirror table.
+   - Userspace datapath:
+     * New 'esp' tunnel type, which carries IPv4 and IPv6 packets in IPsec
+       ESP tunnel mode with AES-GCM, encrypted by the datapath threads.
+       The keys are configured manually for now.
 
 
 v4.0.0 - 17 Aug 2026
