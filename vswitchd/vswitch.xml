@@ -2923,6 +2923,21 @@
             </p>
           </dd>
 
+          <dt><code>esp</code></dt>
+          <dd>
+            <p>
+            An IPsec tunnel that encapsulates L3 traffic, IPv4 or IPv6, with
+            the Encapsulating Security Payload (ESP) in tunnel mode, as
+            defined in RFC 4303, over IPv4 or IPv6.  Packets are encrypted
+            and authenticated with AES-GCM (RFC 4106) by the datapath
+            itself, so the tunnel is only supported by the userspace
+            datapath, e.g. with DPDK, and requires Open vSwitch to be built
+            with OpenSSL.  The security associations are configured with
+            ESP specific options.  It interoperates with other IPsec
+            implementations, such as the Linux kernel's, in tunnel mode.
+            </p>
+          </dd>
+
         </dl>
       </column>
     </group>
@@ -2931,7 +2946,8 @@
       <p>
         These options apply to interfaces with <ref column="type"/> of
         <code>geneve</code>, <code>bareudp</code>, <code>gre</code>,
-        <code>ip6gre</code>, <code>vxlan</code>, and <code>srv6</code>.
+        <code>ip6gre</code>, <code>vxlan</code>, <code>srv6</code>, and
+        <code>esp</code>.
       </p>
 
       <p>
@@ -2945,7 +2961,8 @@
         a port defines one and another port defines the other.
         <ref column="options" key="in_key"/> is not applicable for bareudp
         and srv6 tunnels. Hence it is not considered while identifying
-        bareudp or srv6 tunnels.
+        bareudp or srv6 tunnels.  For esp tunnels, the key is the inbound SPI,
+        see <ref column="options" key="esp_in_spi"/>.
       </p>
 
       <column name="options" key="remote_ip">
@@ -3013,9 +3030,9 @@
 
       <column name="options" key="in_key">
         <p>
-          Optional, not applicable for <code>bareudp</code> and
-          <code>srv6</code>. The key that received packets must contain,
-          one of:
+          Optional, not applicable for <code>bareudp</code>,
+          <code>srv6</code> and <code>esp</code>. The key that received
+          packets must contain, one of:
         </p>
 
         <ul>
@@ -3043,9 +3060,9 @@
 
       <column name="options" key="out_key">
       <p>
-        Optional, not applicable for <code>bareudp</code> and
-        <code>srv6</code>. The key to be set on outgoing packets,
-        one of:
+        Optional, not applicable for <code>bareudp</code>,
+        <code>srv6</code> and <code>esp</code>. The key to be set on outgoing
+        packets, one of:
       </p>
 
         <ul>
@@ -3349,6 +3366,91 @@
             over the L3/L4 fields of the inner packet.
           </li>
         </ul>
+      </column>
+    </group>
+
+    <group title="Tunnel Options: esp only">
+      <p>
+        These options configure the two security associations (SAs) of an
+        <code>esp</code> tunnel: the inbound SA, for packets received from
+        <ref column="options" key="remote_ip"/>, and the outbound SA, for
+        packets sent to it.  The peer must be configured with the same keys,
+        with inbound and outbound swapped.  <ref column="options"
+        key="remote_ip"/> and <ref column="options" key="local_ip"/> cannot be
+        <code>flow</code>.
+      </p>
+
+      <p>
+        These options set the keys manually, which RFC 4301 permits but which
+        has limitations: the keys are never changed, and when either end
+        restarts, its sequence numbers start again from 1, so the anti-replay
+        window of the other end drops its packets until that end restarts too
+        or the SAs are reconfigured with new SPIs or keys.  With manual keys,
+        Open vSwitch uses a random initialization vector base for each SA, so
+        that a restart does not reuse the GCM nonces.
+      </p>
+
+      <column name="options" key="esp_in_spi">
+        <p>
+          Required.  The Security Parameters Index (SPI) of received packets,
+          an integer between 256 and 4294967295, in decimal or, with a
+          <code>0x</code> prefix, hexadecimal.  It must differ from the
+          <ref column="options" key="esp_in_spi"/> of every other
+          <code>esp</code> tunnel.  Received packets have their SPI in the
+          <code>tun_id</code> field for matching in the flow table.
+        </p>
+      </column>
+
+      <column name="options" key="esp_out_spi">
+        <p>
+          Required.  The SPI of sent packets, in the same format as
+          <ref column="options" key="esp_in_spi"/>.  Two <code>esp</code>
+          tunnels with the same <ref column="options" key="remote_ip"/> must
+          have different values.
+        </p>
+      </column>
+
+      <column name="options" key="esp_in_key">
+        <p>
+          Required.  The key for received packets: an AES-128, AES-192 or
+          AES-256 key followed by a 4-byte salt, that is 20, 28 or 36 bytes, as
+          hexadecimal digits with an optional <code>0x</code> prefix.  This is
+          the format of the key of the Linux <code>ip xfrm state</code>
+          command with <code>aead 'rfc4106(gcm(aes))' <var>key</var>
+          128</code>.  The integrity check value is always 16 bytes.
+        </p>
+        <p>
+          Anyone with read access to the database can read this key.
+        </p>
+      </column>
+
+      <column name="options" key="esp_out_key">
+        <p>
+          Required.  The key for sent packets, in the same format as
+          <ref column="options" key="esp_in_key"/>.
+        </p>
+      </column>
+
+      <column name="options" key="esp_esn" type='{"type": "boolean"}'>
+        <p>
+          Optional.  If <code>true</code>, use 64-bit Extended Sequence Numbers
+          (ESN).  Otherwise, sequence numbers are 32 bits long, and a tunnel
+          stops sending packets after 2**32 - 1 of them, which happens in
+          minutes at high packet rates.  Both ends must agree.  Defaults to
+          <code>false</code>.
+        </p>
+      </column>
+
+      <column name="options" key="esp_replay_window"
+              type='{"type": "integer", "minInteger": 0, "maxInteger": 4096}'>
+        <p>
+          Optional.  The size, in packets, of the anti-replay window of the
+          inbound SA, rounded up to a multiple of 64.  Received packets
+          that are older than the window, or that were already received, are
+          dropped.  <code>0</code> disables the anti-replay check, which is
+          not allowed with <ref column="options" key="esp_esn"/>.  Defaults
+          to 64.
+        </p>
       </column>
     </group>
 

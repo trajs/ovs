@@ -176,6 +176,12 @@ struct netdev_tunnel_config {
     #define SRV6_MAX_SEGS 6
     struct in6_addr srv6_segs[SRV6_MAX_SEGS];
     enum netdev_srv6_flowlabel srv6_flowlabel;
+
+    /* ESP.  The keys are only kept in the tunnel's security associations. */
+    ovs_be32 esp_in_spi;
+    ovs_be32 esp_out_spi;
+    bool esp_esn;
+    uint16_t esp_replay_window;
 };
 
 void netdev_run(void);

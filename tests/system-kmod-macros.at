@@ -246,6 +246,14 @@ m4_define([OVS_CHECK_SRV6],
     AT_SKIP_IF([:])
 ])
 
+# OVS_CHECK_ESP()
+#
+# The kernel datapath does not support this feature.
+m4_define([OVS_CHECK_ESP],
+[
+    AT_SKIP_IF([:])
+])
+
 # CHECK_LATER_IPV6_FRAGMENTS()
 #
 # Upstream kernels beetween 4.20 and 5.19 are not parsing IPv6 fragments
