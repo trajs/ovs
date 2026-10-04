@@ -6,6 +6,8 @@ Post-v4.0.0
        The keys are configured manually for now.
      * New 'esp/show' unixctl command to display the security associations
        of 'esp' tunnels and their statistics.
+     * 'esp' tunnels support UDP encapsulation for NAT traversal, and TCP
+       segmentation in software when userspace TSO is enabled.
 
 v4.0.0 - 17 Aug 2026
 --------------------

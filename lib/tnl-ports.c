@@ -176,7 +176,9 @@ tnl_type_to_nw_proto(const char type[], uint8_t nw_protos[2])
         nw_protos[0] = IPPROTO_IPIP;
         nw_protos[1] = IPPROTO_IPV6;
     } else if (!strcmp(type, "esp")) {
+        /* ESP, or ESP in UDP for NAT traversal. */
         nw_protos[0] = IPPROTO_ESP;
+        nw_protos[1] = IPPROTO_UDP;
     }
 }
 
@@ -219,6 +221,11 @@ tnl_port_map_insert(odp_port_t port, ovs_be16 tp_port,
     int i;
 
     tnl_type_to_nw_proto(type, nw_protos);
+    if (!strcmp(type, "esp")) {
+        /* An esp tunnel port uses UDP only if it has a UDP port. */
+        nw_protos[0] = tp_port ? IPPROTO_UDP : IPPROTO_ESP;
+        nw_protos[1] = 0;
+    }
 
     for (i = 0; i < 2; i++) {
         if (nw_protos[i]) {

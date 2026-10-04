@@ -56,6 +56,8 @@ COVERAGE_DEFINE(native_tnl_l3csum_checked);
 COVERAGE_DEFINE(native_tnl_l3csum_err);
 COVERAGE_DEFINE(native_tnl_l4csum_checked);
 COVERAGE_DEFINE(native_tnl_l4csum_err);
+COVERAGE_DEFINE(native_tnl_esp_natt_keepalive);
+COVERAGE_DEFINE(native_tnl_esp_natt_non_esp);
 
 #define VXLAN_HLEN   (sizeof(struct udp_header) +         \
                       sizeof(struct vxlanhdr))
@@ -1121,10 +1123,24 @@ netdev_esp_build_header(const struct netdev *netdev,
     const struct netdev_tunnel_config *tnl_cfg;
     struct esp_header *esp;
 
+    tnl_cfg = netdev_get_tunnel_config(netdev);
+    if (tnl_cfg->dst_port) {
+        /* ESP in UDP, for NAT traversal (RFC 3948).  The source port is the
+         * same as the destination port, and the checksum is zero for IPv4
+         * and computed later for IPv6. */
+        struct udp_header *udp;
+
+        udp = netdev_tnl_ip_build_header(data, params, IPPROTO_UDP, 0);
+        udp->udp_src = tnl_cfg->dst_port;
+        udp->udp_dst = tnl_cfg->dst_port;
+        data->header_len += sizeof *udp;
+        esp = (struct esp_header *) (udp + 1);
+    } else {
+        esp = netdev_tnl_ip_build_header(data, params, IPPROTO_ESP, 0);
+    }
+
     /* netdev_esp_push_header() finds the outbound SA from this SPI and the
      * destination address, and fills in the rest of the ESP header. */
-    tnl_cfg = netdev_get_tunnel_config(netdev);
-    esp = netdev_tnl_ip_build_header(data, params, IPPROTO_ESP, 0);
     put_16aligned_be32(&esp->spi, tnl_cfg->esp_out_spi);
     put_16aligned_be32(&esp->seq_no, 0);
     memset(esp + 1, 0, ESP_IV_LEN);
@@ -1146,7 +1162,9 @@ netdev_esp_push_header(const struct netdev *netdev,
     size_t payload_len;
     struct esp_sa *sa;
     uint8_t next_hdr;
+    uint8_t nw_proto;
     int ip_tot_size;
+    void *l4;
 
     if (packet->packet_type == htonl(PT_IPV4)) {
         next_hdr = IPPROTO_IPIP;
@@ -1163,8 +1181,8 @@ netdev_esp_push_header(const struct netdev *netdev,
     dp_packet_set_size(packet, payload_len);
 
     dp_packet_put_uninit(packet, esp_trailer_len(payload_len));
-    esp = netdev_tnl_push_ip_header(packet, data->header, data->header_len,
-                                    &ip_tot_size, 0);
+    l4 = netdev_tnl_push_ip_header(packet, data->header, data->header_len,
+                                   &ip_tot_size, 0);
 
     /* 'netdev' is the datapath port shared by all esp tunnels, so find the
      * outbound SA from the SPI and destination in the header. */
@@ -1172,11 +1190,31 @@ netdev_esp_push_header(const struct netdev *netdev,
         const struct ovs_16aligned_ip6_hdr *ip6 = dp_packet_l3(packet);
 
         memcpy(&dst, &ip6->ip6_dst, sizeof dst);
+        nw_proto = ip6->ip6_nxt;
     } else {
         const struct ip_header *ip = dp_packet_l3(packet);
 
         in6_addr_set_mapped_ipv4(&dst, get_16aligned_be32(&ip->ip_dst));
+        nw_proto = ip->ip_proto;
     }
+
+    if (nw_proto == IPPROTO_UDP) {
+        struct udp_header *udp = l4;
+
+        udp->udp_len = htons(ip_tot_size);
+        dp_packet_l4_proto_set_udp(packet);
+        if (netdev_tnl_is_header_ipv6(data->header)) {
+            /* A zero checksum is not allowed over IPv6.  It is computed
+             * when the packet is sent, after encryption. */
+            dp_packet_l4_checksum_set_partial(packet);
+        } else {
+            dp_packet_l4_checksum_set_good(packet);
+        }
+        esp = (struct esp_header *) (udp + 1);
+    } else {
+        esp = l4;
+    }
+
     sa = esp_sad_lookup(get_16aligned_be32(&esp->spi), &dst);
     if (OVS_UNLIKELY(!sa)) {
         return ENOENT;
@@ -1194,15 +1232,56 @@ netdev_esp_pop_header(struct dp_packet *packet)
     struct esp_header *esp;
     unsigned int hlen;
     uint8_t next_hdr;
+    uint8_t nw_proto;
     ovs_be32 spi;
+    void *l4;
 
     pkt_metadata_init_tnl(md);
-    esp = ip_extract_tnl_md(packet, tnl, &hlen);
-    if (!esp) {
+    l4 = ip_extract_tnl_md(packet, tnl, &hlen);
+    if (!l4) {
         goto err;
     }
-
     esp_len = dp_packet_size(packet) - dp_packet_l2_pad_size(packet) - hlen;
+
+    if (netdev_tnl_is_header_ipv6(dp_packet_data(packet))) {
+        nw_proto = ((struct ovs_16aligned_ip6_hdr *) dp_packet_l3(packet))
+                   ->ip6_nxt;
+    } else {
+        nw_proto = ((struct ip_header *) dp_packet_l3(packet))->ip_proto;
+    }
+
+    if (nw_proto == IPPROTO_UDP) {
+        /* ESP in UDP (RFC 3948). */
+        struct udp_header *udp = l4;
+        const uint8_t *payload = (const uint8_t *) (udp + 1);
+
+        if (esp_len < sizeof *udp) {
+            goto err;
+        }
+        esp_len -= sizeof *udp;
+        hlen += sizeof *udp;
+        tnl->tp_src = udp->udp_src;
+        tnl->tp_dst = udp->udp_dst;
+
+        if (esp_len == 1 && payload[0] == 0xff) {
+            /* NAT keepalive (RFC 3948 section 2.3). */
+            COVERAGE_INC(native_tnl_esp_natt_keepalive);
+            goto err;
+        }
+        static const uint8_t non_esp_marker[4];
+
+        if (esp_len >= sizeof non_esp_marker
+            && !memcmp(payload, non_esp_marker, sizeof non_esp_marker)) {
+            /* Non-ESP marker: an IKE packet (RFC 3948 section 2.2), which
+             * is not for the datapath. */
+            COVERAGE_INC(native_tnl_esp_natt_non_esp);
+            goto err;
+        }
+        esp = (struct esp_header *) (udp + 1);
+    } else {
+        esp = l4;
+    }
+
     if (esp_open(esp, esp_len, &spi, &next_hdr, &payload_len)) {
         goto err;
     }

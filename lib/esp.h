@@ -53,6 +53,9 @@
 /* An AES-256 key followed by the 4-byte salt, as in RFC 4106. */
 #define ESP_MAX_KEY_LEN (32 + ESP_SALT_LEN)
 
+/* UDP port for ESP in UDP, for NAT traversal (RFC 3948). */
+#define ESP_UDP_ENCAP_PORT 4500
+
 #define ESP_DEFAULT_REPLAY_WINDOW 64
 #define ESP_MAX_REPLAY_WINDOW     4096
 

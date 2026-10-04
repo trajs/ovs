@@ -294,7 +294,10 @@ Q: Does the userspace datapath, for example with DPDK, support IPsec?
 
     * Keys are configured manually.  Key exchange (IKE) is not supported yet.
 
-    * Only tunnel mode, without UDP encapsulation for NAT traversal.
+    * Only tunnel mode.  ESP can be carried in UDP for NAT traversal
+      (``options:esp_udp_encap=true``), but the peer's UDP port is not
+      learned from received packets, and an IKE daemon on the same address
+      cannot use the same port.
 
     * Encapsulated packets are not fragmented, and received ESP packets that
       are fragments are not reassembled, so the MTU of the inner interfaces

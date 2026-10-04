@@ -3452,6 +3452,33 @@
           to 64.
         </p>
       </column>
+
+      <column name="options" key="esp_udp_encap" type='{"type": "boolean"}'>
+        <p>
+          Optional.  If <code>true</code>, ESP packets are carried in UDP, as
+          described in RFC 3948, so that the tunnel can cross network address
+          translation (NAT).  Packets are sent from and to <ref
+          column="options" key="esp_udp_port"/>, with a zero UDP checksum over
+          IPv4, and the tunnel receives ESP in UDP on that port instead of
+          plain ESP.  The peer must be configured the same way, e.g. with
+          <code>encap espinudp 4500 4500 0.0.0.0</code> for Linux.  Defaults to
+          <code>false</code>.
+        </p>
+        <p>
+          The datapath then receives every UDP packet to that port and to the
+          tunnel's local address.  It drops NAT keepalives and IKE packets,
+          which start with a zero non-ESP marker, so an IKE daemon on the same
+          address cannot use that port.
+        </p>
+      </column>
+
+      <column name="options" key="esp_udp_port"
+              type='{"type": "integer", "minInteger": 1, "maxInteger": 65535}'>
+        <p>
+          Optional.  The UDP port for <ref column="options"
+          key="esp_udp_encap"/>.  Defaults to 4500.
+        </p>
+      </column>
     </group>
 
     <group title="Patch Options">

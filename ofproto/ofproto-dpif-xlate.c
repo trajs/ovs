@@ -3859,8 +3859,9 @@ static void
 propagate_tunnel_data_to_flow(struct xlate_ctx *ctx, struct eth_addr dmac,
                               struct eth_addr smac,   struct in6_addr s_ip6,
                               ovs_be32 s_ip, bool is_tnl_ipv6,
-                              enum ovs_vport_type tnl_type)
+                              const struct ovs_action_push_tnl *tnl_push_data)
 {
+    enum ovs_vport_type tnl_type = tnl_push_data->tnl_type;
     struct flow *base_flow, *flow;
     flow = &ctx->xin->flow;
     base_flow = &ctx->base_flow;
@@ -3883,9 +3884,21 @@ propagate_tunnel_data_to_flow(struct xlate_ctx *ctx, struct eth_addr dmac,
         nw_proto = (flow->dl_type == htons(ETH_TYPE_IP))
                    ? IPPROTO_IPIP : IPPROTO_IPV6;
         break;
-    case OVS_VPORT_TYPE_ESP:
-        nw_proto = IPPROTO_ESP;
+    case OVS_VPORT_TYPE_ESP: {
+        /* ESP, or ESP in UDP for NAT traversal, as in the pushed header. */
+        const struct eth_header *eth = (const void *) tnl_push_data->header;
+
+        if (is_tnl_ipv6) {
+            const struct ovs_16aligned_ip6_hdr *ip6 = (const void *) (eth + 1);
+
+            nw_proto = ip6->ip6_nxt;
+        } else {
+            const struct ip_header *ip = (const void *) (eth + 1);
+
+            nw_proto = ip->ip_proto;
+        }
         break;
+    }
     case OVS_VPORT_TYPE_UNSPEC:
     case OVS_VPORT_TYPE_NETDEV:
     case OVS_VPORT_TYPE_INTERNAL:
@@ -4035,8 +4048,7 @@ native_tunnel_output(struct xlate_ctx *ctx, const struct xport *xport,
      * any more when sending packet to tunnel. */
 
     propagate_tunnel_data_to_flow(ctx, dmac, smac, s_ip6,
-                                  s_ip, tnl_params.is_ipv6,
-                                  tnl_push_data.tnl_type);
+                                  s_ip, tnl_params.is_ipv6, &tnl_push_data);
 
     size_t offset;
     size_t push_action_size;

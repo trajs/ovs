@@ -118,7 +118,9 @@ netdev_vport_needs_dst_port(const struct netdev *dev)
 
     return (class->get_config == get_tunnel_config &&
             (!strcmp("geneve", type) || !strcmp("vxlan", type) ||
-             !strcmp("gtpu", type) || !strcmp("bareudp",type)));
+             !strcmp("gtpu", type) || !strcmp("bareudp",type) ||
+             (!strcmp("esp", type)
+              && netdev_get_tunnel_config(dev)->dst_port)));
 }
 
 const char *
@@ -225,6 +227,9 @@ netdev_vport_construct(struct netdev *netdev_)
     } else if (!strcmp(type, "gtpu")) {
         tnl_cfg->dst_port = port ? htons(port) : htons(GTPU_DST_PORT);
     } else if (!strcmp(type, "bareudp")) {
+        tnl_cfg->dst_port = htons(port);
+    } else if (!strcmp(type, "esp")) {
+        /* ESP in UDP, for NAT traversal, if a port is specified. */
         tnl_cfg->dst_port = htons(port);
     }
 
@@ -637,7 +642,8 @@ is_esp_option(const char *key)
 {
     return (!strcmp(key, "esp_in_spi") || !strcmp(key, "esp_out_spi")
             || !strcmp(key, "esp_in_key") || !strcmp(key, "esp_out_key")
-            || !strcmp(key, "esp_esn") || !strcmp(key, "esp_replay_window"));
+            || !strcmp(key, "esp_esn") || !strcmp(key, "esp_replay_window")
+            || !strcmp(key, "esp_udp_encap") || !strcmp(key, "esp_udp_port"));
 }
 
 /* Parses the ESP options in 'args' for ESP tunnel 'dev', checks them against
@@ -707,6 +713,18 @@ esp_tunnel_config(struct netdev_vport *dev, const struct smap *args,
         ds_put_format(errors, "%s: bad 'esp_out_key': %s\n", name, error);
         free(error);
         return EINVAL;
+    }
+
+    if (smap_get_bool(args, "esp_udp_encap", false)) {
+        unsigned int port = smap_get_uint(args, "esp_udp_port",
+                                          ESP_UDP_ENCAP_PORT);
+
+        if (!port || port > UINT16_MAX) {
+            ds_put_format(errors, "%s: 'esp_udp_port' must be between 1 "
+                          "and 65535\n", name);
+            return EINVAL;
+        }
+        tnl_cfg->dst_port = htons(port);
     }
 
     in.esn = out.esn = smap_get_bool(args, "esp_esn", false);
@@ -919,7 +937,8 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
         tnl_cfg.dst_port = htons(GTPU_DST_PORT);
     }
 
-    needs_dst_port = netdev_vport_needs_dst_port(dev_);
+    /* For esp tunnels, the UDP port is set with 'esp_udp_port'. */
+    needs_dst_port = netdev_vport_needs_dst_port(dev_) && !is_esp;
     tnl_cfg.dont_fragment = true;
 
     SMAP_FOR_EACH (node, args) {
@@ -1290,6 +1309,13 @@ get_tunnel_config(const struct netdev *dev, struct smap *args)
         if (tnl_cfg->esp_replay_window != ESP_DEFAULT_REPLAY_WINDOW) {
             smap_add_format(args, "esp_replay_window", "%"PRIu16,
                             tnl_cfg->esp_replay_window);
+        }
+        if (tnl_cfg->dst_port) {
+            smap_add(args, "esp_udp_encap", "true");
+            if (ntohs(tnl_cfg->dst_port) != ESP_UDP_ENCAP_PORT) {
+                smap_add_format(args, "esp_udp_port", "%"PRIu16,
+                                ntohs(tnl_cfg->dst_port));
+            }
         }
     } else if (tnl_cfg->in_key_flow && tnl_cfg->out_key_flow) {
         smap_add(args, "key", "flow");
