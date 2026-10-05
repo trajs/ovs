@@ -265,7 +265,8 @@ Q: Does the userspace datapath, for example with DPDK, support IPsec?
     ``esp`` tunnel type, which carries IPv4 and IPv6 packets in IPsec ESP
     tunnel mode (RFC 4303) with AES-GCM (RFC 4106).  The datapath threads
     encrypt and decrypt the packets themselves, so this requires Open vSwitch
-    to be built with OpenSSL.
+    to be built with the Intel IPsec Multi-Buffer library, which is faster,
+    or with OpenSSL.
 
     This is different from the IPsec support described in
     :doc:`/howto/ipsec`, where ``ovs-monitor-ipsec`` has the Linux kernel

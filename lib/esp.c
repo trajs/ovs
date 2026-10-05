@@ -18,9 +18,15 @@
 #include <errno.h>
 #include <string.h>
 
-#ifdef HAVE_OPENSSL
+/* AES-GCM comes from the Intel IPsec Multi-Buffer library if available,
+ * otherwise from OpenSSL.  Without either, SAs cannot be created. */
+#if defined(HAVE_IPSEC_MB)
+#include <intel-ipsec-mb.h>
+#define ESP_CRYPTO 1
+#elif defined(HAVE_OPENSSL)
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#define ESP_CRYPTO 1
 #endif
 
 #include "byte-order.h"
@@ -48,7 +54,9 @@ struct esp_sa {
     struct cmap_node node;          /* In 'esp_sad', for inbound SAs. */
     struct esp_sa_params params;
     uint64_t id;                    /* Unique, never 0. */
-#ifdef HAVE_OPENSSL
+#if defined(HAVE_IPSEC_MB)
+    struct gcm_key_data *gcm_key;   /* Expanded key, cache line aligned. */
+#elif defined(HAVE_OPENSSL)
     const EVP_CIPHER *cipher;
 #endif
 
@@ -78,11 +86,28 @@ struct esp_sa {
     uint64_t *replay_bitmap OVS_GUARDED;
 };
 
-#ifdef HAVE_OPENSSL
-#define OVS_UNUSED_WITHOUT_OPENSSL
+#ifdef ESP_CRYPTO
+#define OVS_UNUSED_WITHOUT_CRYPTO
 #else
-#define OVS_UNUSED_WITHOUT_OPENSSL OVS_UNUSED
+#define OVS_UNUSED_WITHOUT_CRYPTO OVS_UNUSED
 #endif
+
+#ifdef ESP_CRYPTO
+static void esp_crypto_init_sa(struct esp_sa *);
+static void esp_crypto_uninit_sa(struct esp_sa *);
+#endif
+
+/* Overwrites the 'n' bytes at 'p' with zeros, in a way the compiler does not
+ * optimize away, to erase key material. */
+static void
+esp_memwipe(void *p, size_t n)
+{
+    volatile uint8_t *v = p;
+
+    while (n--) {
+        *v++ = 0;
+    }
+}
 
 /* SA database, indexed by SPI and destination.  Only written by the main
  * thread. */
@@ -91,7 +116,7 @@ static struct cmap esp_sad = CMAP_INITIALIZER;
 bool
 esp_is_supported(void)
 {
-#ifdef HAVE_OPENSSL
+#ifdef ESP_CRYPTO
     return true;
 #else
     return false;
@@ -152,22 +177,16 @@ esp_sa_params_equal(const struct esp_sa_params *a,
 /* Returns a new SA for 'params', or NULL if ESP is not supported or 'params'
  * is invalid. */
 struct esp_sa *
-esp_sa_create(const struct esp_sa_params *params OVS_UNUSED_WITHOUT_OPENSSL)
+esp_sa_create(const struct esp_sa_params *params OVS_UNUSED_WITHOUT_CRYPTO)
 {
-#ifdef HAVE_OPENSSL
+#ifdef ESP_CRYPTO
     static atomic_uint64_t next_id = 1;
-    const EVP_CIPHER *cipher;
     struct esp_sa *sa;
 
     switch (params->key_len - ESP_SALT_LEN) {
     case 16:
-        cipher = EVP_aes_128_gcm();
-        break;
     case 24:
-        cipher = EVP_aes_192_gcm();
-        break;
     case 32:
-        cipher = EVP_aes_256_gcm();
         break;
     default:
         return NULL;
@@ -184,7 +203,7 @@ esp_sa_create(const struct esp_sa_params *params OVS_UNUSED_WITHOUT_OPENSSL)
     sa = xzalloc(sizeof *sa);
     sa->params = *params;
     atomic_add_relaxed(&next_id, 1, &sa->id);
-    sa->cipher = cipher;
+    esp_crypto_init_sa(sa);
     atomic_init(&sa->seq, 0);
     atomic_init(&sa->n_packets, 0);
     atomic_init(&sa->n_bytes, 0);
@@ -212,9 +231,10 @@ esp_sa_destroy(struct esp_sa *sa)
     if (sa) {
         ovs_mutex_destroy(&sa->replay_mutex);
         free(sa->replay_bitmap);
-#ifdef HAVE_OPENSSL
-        OPENSSL_cleanse(sa->params.key, sizeof sa->params.key);
+#ifdef ESP_CRYPTO
+        esp_crypto_uninit_sa(sa);
 #endif
+        esp_memwipe(sa->params.key, sizeof sa->params.key);
         free(sa);
     }
 }
@@ -234,7 +254,7 @@ esp_sa_get_params(const struct esp_sa *sa)
     return &sa->params;
 }
 
-#ifdef HAVE_OPENSSL
+#ifdef ESP_CRYPTO
 static void
 esp_stat_inc(atomic_uint64_t *counter, uint64_t n)
 {
@@ -389,7 +409,7 @@ esp_sad_lookup(ovs_be32 sad_id, const struct in6_addr *dst)
     return NULL;
 }
 
-#ifdef HAVE_OPENSSL
+#ifdef ESP_CRYPTO
 /* Anti-replay window. */
 
 /* Determines the full sequence number of a packet whose transmitted (low 32)
@@ -517,7 +537,7 @@ esp_replay_update(struct esp_sa *sa, uint64_t seq)
     return ok;
 }
 
-#endif /* HAVE_OPENSSL */
+#endif /* ESP_CRYPTO */
 
 /* Packet processing. */
 
@@ -531,7 +551,133 @@ esp_trailer_len(size_t payload_len)
     return pad_len + ESP_TRAILER_LEN + ESP_ICV_LEN;
 }
 
-#ifdef HAVE_OPENSSL
+#ifdef ESP_CRYPTO
+#if defined(HAVE_IPSEC_MB)
+/* The Intel IPsec Multi-Buffer library's direct AES-GCM functions only read
+ * the manager's function table, so all threads share one manager. */
+static IMB_MGR *esp_imb_mgr;
+
+static void
+esp_crypto_init_sa(struct esp_sa *sa)
+{
+    static struct ovsthread_once once = OVSTHREAD_ONCE_INITIALIZER;
+    const uint8_t *key = sa->params.key;
+
+    if (ovsthread_once_start(&once)) {
+        IMB_ARCH arch;
+
+        esp_imb_mgr = alloc_mb_mgr(0);
+        ovs_assert(esp_imb_mgr);
+        init_mb_mgr_auto(esp_imb_mgr, &arch);
+        VLOG_INFO("using Intel IPsec Multi-Buffer library %s (%s) for "
+                  "AES-GCM", imb_get_version_str(),
+                  arch == IMB_ARCH_AVX512 ? "AVX512"
+                  : arch == IMB_ARCH_AVX2 ? "AVX2"
+                  : arch == IMB_ARCH_AVX ? "AVX"
+                  : arch == IMB_ARCH_SSE ? "SSE" : "no AES-NI");
+        ovsthread_once_done(&once);
+    }
+
+    sa->gcm_key = xmalloc_cacheline(sizeof *sa->gcm_key);
+    switch (sa->params.key_len - ESP_SALT_LEN) {
+    case 16:
+        IMB_AES128_GCM_PRE(esp_imb_mgr, key, sa->gcm_key);
+        break;
+    case 24:
+        IMB_AES192_GCM_PRE(esp_imb_mgr, key, sa->gcm_key);
+        break;
+    default:
+        IMB_AES256_GCM_PRE(esp_imb_mgr, key, sa->gcm_key);
+        break;
+    }
+}
+
+static void
+esp_crypto_uninit_sa(struct esp_sa *sa)
+{
+    esp_memwipe(sa->gcm_key, sizeof *sa->gcm_key);
+    free_cacheline(sa->gcm_key);
+}
+
+/* Encrypts the 'len' bytes at 'data' in place and stores the ICV in 'tag'. */
+static bool
+esp_gcm_encrypt(const struct esp_sa *sa, const uint8_t *nonce,
+                const uint8_t *aad, size_t aad_len, uint8_t *data,
+                size_t len, uint8_t *tag)
+{
+    struct gcm_context_data ctx;
+
+    switch (sa->params.key_len - ESP_SALT_LEN) {
+    case 16:
+        IMB_AES128_GCM_ENC(esp_imb_mgr, sa->gcm_key, &ctx, data, data, len,
+                           nonce, aad, aad_len, tag, ESP_ICV_LEN);
+        break;
+    case 24:
+        IMB_AES192_GCM_ENC(esp_imb_mgr, sa->gcm_key, &ctx, data, data, len,
+                           nonce, aad, aad_len, tag, ESP_ICV_LEN);
+        break;
+    default:
+        IMB_AES256_GCM_ENC(esp_imb_mgr, sa->gcm_key, &ctx, data, data, len,
+                           nonce, aad, aad_len, tag, ESP_ICV_LEN);
+        break;
+    }
+    return true;
+}
+
+/* Decrypts the 'len' bytes at 'data' in place and returns true if they and
+ * 'aad' match the ICV in 'tag'. */
+static bool
+esp_gcm_decrypt(const struct esp_sa *sa, const uint8_t *nonce,
+                const uint8_t *aad, size_t aad_len, uint8_t *data,
+                size_t len, const uint8_t *tag)
+{
+    struct gcm_context_data ctx;
+    uint8_t computed[ESP_ICV_LEN];
+    uint8_t diff = 0;
+
+    switch (sa->params.key_len - ESP_SALT_LEN) {
+    case 16:
+        IMB_AES128_GCM_DEC(esp_imb_mgr, sa->gcm_key, &ctx, data, data, len,
+                           nonce, aad, aad_len, computed, ESP_ICV_LEN);
+        break;
+    case 24:
+        IMB_AES192_GCM_DEC(esp_imb_mgr, sa->gcm_key, &ctx, data, data, len,
+                           nonce, aad, aad_len, computed, ESP_ICV_LEN);
+        break;
+    default:
+        IMB_AES256_GCM_DEC(esp_imb_mgr, sa->gcm_key, &ctx, data, data, len,
+                           nonce, aad, aad_len, computed, ESP_ICV_LEN);
+        break;
+    }
+
+    /* Constant time, to not tell how much of a forged ICV is right. */
+    for (size_t i = 0; i < ESP_ICV_LEN; i++) {
+        diff |= computed[i] ^ tag[i];
+    }
+    return !diff;
+}
+#elif defined(HAVE_OPENSSL)
+static void
+esp_crypto_init_sa(struct esp_sa *sa)
+{
+    switch (sa->params.key_len - ESP_SALT_LEN) {
+    case 16:
+        sa->cipher = EVP_aes_128_gcm();
+        break;
+    case 24:
+        sa->cipher = EVP_aes_192_gcm();
+        break;
+    default:
+        sa->cipher = EVP_aes_256_gcm();
+        break;
+    }
+}
+
+static void
+esp_crypto_uninit_sa(struct esp_sa *sa OVS_UNUSED)
+{
+}
+
 /* Each thread keeps a few cipher contexts with their keys already expanded,
  * indexed by SA and direction.  A collision only costs a key expansion. */
 #define ESP_CTX_CACHE_SIZE 16
@@ -597,6 +743,44 @@ esp_get_ctx(const struct esp_sa *sa, bool enc)
     return slot->ctx;
 }
 
+/* Encrypts the 'len' bytes at 'data' in place and stores the ICV in 'tag'. */
+static bool
+esp_gcm_encrypt(const struct esp_sa *sa, const uint8_t *nonce,
+                const uint8_t *aad, size_t aad_len, uint8_t *data,
+                size_t len, uint8_t *tag)
+{
+    EVP_CIPHER_CTX *ctx = esp_get_ctx(sa, true);
+    int n;
+
+    return (ctx
+            && EVP_CipherInit_ex(ctx, NULL, NULL, NULL, nonce, 1)
+            && EVP_CipherUpdate(ctx, NULL, &n, aad, aad_len)
+            && EVP_CipherUpdate(ctx, data, &n, data, len)
+            && EVP_CipherFinal_ex(ctx, data + n, &n)
+            && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, ESP_ICV_LEN,
+                                   tag));
+}
+
+/* Decrypts the 'len' bytes at 'data' in place and returns true if they and
+ * 'aad' match the ICV in 'tag'. */
+static bool
+esp_gcm_decrypt(const struct esp_sa *sa, const uint8_t *nonce,
+                const uint8_t *aad, size_t aad_len, uint8_t *data,
+                size_t len, const uint8_t *tag)
+{
+    EVP_CIPHER_CTX *ctx = esp_get_ctx(sa, false);
+    int n;
+
+    return (ctx
+            && EVP_CipherInit_ex(ctx, NULL, NULL, NULL, nonce, 0)
+            && EVP_CipherUpdate(ctx, NULL, &n, aad, aad_len)
+            && EVP_CipherUpdate(ctx, data, &n, data, len)
+            && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, ESP_ICV_LEN,
+                                   CONST_CAST(uint8_t *, tag))
+            && EVP_CipherFinal_ex(ctx, data + n, &n) > 0);
+}
+#endif
+
 /* Builds the AES-GCM nonce and additional authenticated data for a packet
  * with ESP header 'esp' and full sequence number 'seq' (RFC 4106 section 5).
  * Returns the length of the AAD. */
@@ -635,23 +819,21 @@ esp_gcm_prepare(const struct esp_sa *sa, const struct esp_header *esp,
  *
  * Returns 0 if successful, otherwise a positive errno value. */
 int
-esp_seal(struct esp_sa *sa OVS_UNUSED_WITHOUT_OPENSSL,
-         struct esp_header *esp OVS_UNUSED_WITHOUT_OPENSSL,
-         size_t payload_len OVS_UNUSED_WITHOUT_OPENSSL,
-         uint8_t next_hdr OVS_UNUSED_WITHOUT_OPENSSL)
+esp_seal(struct esp_sa *sa OVS_UNUSED_WITHOUT_CRYPTO,
+         struct esp_header *esp OVS_UNUSED_WITHOUT_CRYPTO,
+         size_t payload_len OVS_UNUSED_WITHOUT_CRYPTO,
+         uint8_t next_hdr OVS_UNUSED_WITHOUT_CRYPTO)
 {
-#ifdef HAVE_OPENSSL
+#ifdef ESP_CRYPTO
     uint8_t *payload = (uint8_t *) esp + ESP_PREFIX_LEN;
     size_t ct_len = esp_trailer_len(payload_len) - ESP_ICV_LEN + payload_len;
     size_t pad_len = ct_len - payload_len - ESP_TRAILER_LEN;
     uint8_t nonce[ESP_SALT_LEN + ESP_IV_LEN];
     uint8_t *trailer = payload + payload_len;
-    EVP_CIPHER_CTX *ctx;
     uint8_t aad[12];
     size_t aad_len;
     uint64_t seq;
     ovs_be64 iv;
-    int len;
 
     atomic_add_relaxed(&sa->seq, 1, &seq);
     seq++;
@@ -675,15 +857,8 @@ esp_seal(struct esp_sa *sa OVS_UNUSED_WITHOUT_OPENSSL,
 
     aad_len = esp_gcm_prepare(sa, esp, seq, nonce, aad);
 
-    ctx = esp_get_ctx(sa, true);
-    if (OVS_UNLIKELY(!ctx
-                     || !EVP_CipherInit_ex(ctx, NULL, NULL, NULL, nonce, 1)
-                     || !EVP_CipherUpdate(ctx, NULL, &len, aad, aad_len)
-                     || !EVP_CipherUpdate(ctx, payload, &len, payload, ct_len)
-                     || !EVP_CipherFinal_ex(ctx, payload + len, &len)
-                     || !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG,
-                                             ESP_ICV_LEN,
-                                             payload + ct_len))) {
+    if (OVS_UNLIKELY(!esp_gcm_encrypt(sa, nonce, aad, aad_len, payload,
+                                      ct_len, payload + ct_len))) {
         COVERAGE_INC(esp_tx_crypto_error);
         esp_stat_inc(&sa->n_tx_errors, 1);
         return EIO;
@@ -707,16 +882,15 @@ esp_seal(struct esp_sa *sa OVS_UNUSED_WITHOUT_OPENSSL,
  * starts ESP_PREFIX_LEN bytes after 'esp'.  Otherwise, returns a positive
  * errno value. */
 int
-esp_open(struct esp_header *esp OVS_UNUSED_WITHOUT_OPENSSL,
-         size_t len OVS_UNUSED_WITHOUT_OPENSSL,
-         ovs_be64 *tun_id OVS_UNUSED_WITHOUT_OPENSSL,
-         uint8_t *next_hdr OVS_UNUSED_WITHOUT_OPENSSL,
-         size_t *payload_len OVS_UNUSED_WITHOUT_OPENSSL)
+esp_open(struct esp_header *esp OVS_UNUSED_WITHOUT_CRYPTO,
+         size_t len OVS_UNUSED_WITHOUT_CRYPTO,
+         ovs_be64 *tun_id OVS_UNUSED_WITHOUT_CRYPTO,
+         uint8_t *next_hdr OVS_UNUSED_WITHOUT_CRYPTO,
+         size_t *payload_len OVS_UNUSED_WITHOUT_CRYPTO)
 {
-#ifdef HAVE_OPENSSL
+#ifdef ESP_CRYPTO
     uint8_t *payload = (uint8_t *) esp + ESP_PREFIX_LEN;
     uint8_t nonce[ESP_SALT_LEN + ESP_IV_LEN];
-    EVP_CIPHER_CTX *ctx;
     uint8_t *trailer;
     struct esp_sa *sa;
     uint8_t *pad;
@@ -726,7 +900,6 @@ esp_open(struct esp_header *esp OVS_UNUSED_WITHOUT_OPENSSL,
     size_t pad_len;
     uint32_t seq_lo;
     uint64_t seq;
-    int out_len;
 
     if (OVS_UNLIKELY(len < ESP_PREFIX_LEN + ESP_TRAILER_LEN + ESP_ICV_LEN)) {
         COVERAGE_INC(esp_rx_malformed);
@@ -749,16 +922,8 @@ esp_open(struct esp_header *esp OVS_UNUSED_WITHOUT_OPENSSL,
 
     aad_len = esp_gcm_prepare(sa, esp, seq, nonce, aad);
 
-    ctx = esp_get_ctx(sa, false);
-    if (OVS_UNLIKELY(!ctx
-                     || !EVP_CipherInit_ex(ctx, NULL, NULL, NULL, nonce, 0)
-                     || !EVP_CipherUpdate(ctx, NULL, &out_len, aad, aad_len)
-                     || !EVP_CipherUpdate(ctx, payload, &out_len, payload,
-                                          ct_len)
-                     || !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG,
-                                             ESP_ICV_LEN, payload + ct_len)
-                     || EVP_CipherFinal_ex(ctx, payload + out_len,
-                                           &out_len) <= 0)) {
+    if (OVS_UNLIKELY(!esp_gcm_decrypt(sa, nonce, aad, aad_len, payload,
+                                      ct_len, payload + ct_len))) {
         COVERAGE_INC(esp_rx_auth_failed);
         esp_stat_inc(&sa->n_auth_failed, 1);
         return EBADMSG;

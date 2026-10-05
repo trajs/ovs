@@ -710,7 +710,8 @@ esp_tunnel_config(struct netdev_vport *dev, const struct smap *args,
 
     if (!esp_is_supported()) {
         ds_put_format(errors, "%s: esp tunnels require Open vSwitch built "
-                      "with OpenSSL\n", name);
+                      "with OpenSSL or the Intel IPsec Multi-Buffer "
+                      "library\n", name);
         return EOPNOTSUPP;
     }
     if (tnl_cfg->ip_dst_flow || tnl_cfg->ip_src_flow) {

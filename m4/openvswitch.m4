@@ -137,6 +137,38 @@ AC_DEFUN([OVS_CHECK_LIBCAPNG],
       AC_SUBST([CAPNG_LDADD])
    fi])
 
+dnl Checks for the Intel IPsec Multi-Buffer library, which esp tunnels use for
+dnl AES-GCM if it is available, instead of OpenSSL.
+AC_DEFUN([OVS_CHECK_IPSEC_MB],
+  [AC_ARG_ENABLE(
+     [ipsec-mb],
+     [AS_HELP_STRING([--disable-ipsec-mb],
+                     [Do not use the Intel IPsec Multi-Buffer library])],
+     [case "${enableval}" in
+        (yes) ipsec_mb=true ;;
+        (no)  ipsec_mb=false ;;
+        (*) AC_MSG_ERROR([bad value ${enableval} for --enable-ipsec-mb]) ;;
+      esac],
+     [ipsec_mb=check])
+
+   HAVE_IPSEC_MB=no
+   if test "$ipsec_mb" != false; then
+       AC_CHECK_HEADER([intel-ipsec-mb.h],
+         [AC_CHECK_LIB([IPSec_MB], [alloc_mb_mgr], [HAVE_IPSEC_MB=yes])])
+       if test "$HAVE_IPSEC_MB" != yes && test "$ipsec_mb" = true; then
+           AC_MSG_ERROR([IPsec Multi-Buffer library requested, but not found])
+       fi
+   fi
+
+   AC_SUBST([HAVE_IPSEC_MB])
+   if test "$HAVE_IPSEC_MB" = yes; then
+      AC_DEFINE([HAVE_IPSEC_MB], [1],
+                [Define to 1 if the Intel IPsec Multi-Buffer library is
+                 available.])
+      IPSEC_MB_LIBS="-lIPSec_MB"
+      AC_SUBST([IPSEC_MB_LIBS])
+   fi])
+
 dnl Checks for OpenSSL.
 AC_DEFUN([OVS_CHECK_OPENSSL],
   [AC_ARG_ENABLE(

@@ -11,6 +11,8 @@ Post-v4.0.0
        from an IKE daemon, such as strongSwan with a 'kernel-ovs' plugin,
        through new 'esp/sa-add', 'esp/sa-del', 'esp/sa-query',
        'esp/sa-flush' and 'esp/spi-alloc' unixctl commands.
+     * 'esp' tunnels use the Intel IPsec Multi-Buffer library for AES-GCM,
+       if it is available at build time, instead of OpenSSL.
 
 v4.0.0 - 17 Aug 2026
 --------------------

@@ -98,6 +98,11 @@ need the following software:
   environment variable OVS_UNBOUND_CONF can be used to specify the
   configuration file for unbound.
 
+- The Intel IPsec Multi-Buffer library (libIPSec_MB), which is optional.  If
+  it is installed, ``esp`` tunnels of the userspace datapath use it for
+  AES-GCM, which is faster than OpenSSL.  Use ``--disable-ipsec-mb`` to build
+  without it.
+
 On Linux, you may use the kernel module distributed with the upstream Linux
 kernel 3.3 or later. You may also use the userspace-only implementation, at
 some cost in features and performance. Refer to :doc:`userspace` for details.

@@ -66,7 +66,7 @@ AT_CLEANUP
 AT_SETUP([IPsec ESP])
 AT_KEYWORDS([esp ipsec])
 AT_SKIP_IF([test "$HAVE_OPENSSL" = no])
-AT_CHECK([ovstest test-esp])
+AT_CHECK([ovstest test-esp], [0], [], [ignore])
 AT_CLEANUP
 
 AT_SETUP([test skiplist])
