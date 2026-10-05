@@ -43,6 +43,7 @@ struct unixctl_command {
     int min_args, max_args;
     unixctl_cb_func *cb;
     void *aux;
+    bool sensitive;             /* Do not log the arguments. */
 };
 
 struct unixctl_conn {
@@ -215,7 +216,22 @@ unixctl_command_register(const char *name, const char *usage,
     command->max_args = max_args;
     command->cb = cb;
     command->aux = aux;
+    command->sensitive = false;
     shash_add(&commands, name, command);
+}
+
+/* Like unixctl_command_register(), for a command whose arguments contain
+ * secrets, such as keys, that must not be logged. */
+void
+unixctl_command_register_sensitive(const char *name, const char *usage,
+                                   int min_args, int max_args,
+                                   unixctl_cb_func *cb, void *aux)
+{
+    struct unixctl_command *command;
+
+    unixctl_command_register(name, usage, min_args, max_args, cb, aux);
+    command = shash_find_data(&commands, name);
+    command->sensitive = true;
 }
 
 enum unixctl_output_fmt
@@ -376,8 +392,11 @@ process_command(struct unixctl_conn *conn, struct jsonrpc_msg *request)
     COVERAGE_INC(unixctl_received);
     conn->request_id = json_clone(request->id);
 
+    command = shash_find_data(&commands, request->method);
     if (VLOG_IS_DBG_ENABLED()) {
-        char *params_s = json_to_string(request->params, 0);
+        char *params_s = (command && command->sensitive
+                          ? xstrdup("[<hidden>]")
+                          : json_to_string(request->params, 0));
         char *id_s = json_to_string(request->id, 0);
         VLOG_DBG("received request %s%s, id=%s",
                  request->method, params_s, id_s);
@@ -386,7 +405,6 @@ process_command(struct unixctl_conn *conn, struct jsonrpc_msg *request)
     }
 
     params = request->params;
-    command = shash_find_data(&commands, request->method);
     if (!command) {
         error = xasprintf("\"%s\" is not a valid command (use "
                           "\"list-commands\" to see a list of valid commands)",

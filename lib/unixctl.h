@@ -56,6 +56,9 @@ typedef void unixctl_cb_func(struct unixctl_conn *,
 void unixctl_command_register(const char *name, const char *usage,
                               int min_args, int max_args,
                               unixctl_cb_func *cb, void *aux);
+void unixctl_command_register_sensitive(const char *name, const char *usage,
+                                        int min_args, int max_args,
+                                        unixctl_cb_func *cb, void *aux);
 enum unixctl_output_fmt unixctl_command_get_output_format(
     struct unixctl_conn *);
 void unixctl_command_reply_error(struct unixctl_conn *, const char *error);
