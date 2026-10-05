@@ -290,9 +290,22 @@ Q: Does the userspace datapath, for example with DPDK, support IPsec?
     plus ``ip xfrm policy`` rules for the traffic to protect.  Received
     packets have their SPI in ``tun_id``.
 
-    The current implementation has these restrictions:
+    Manually configured keys never change, and a restart of either end breaks
+    the tunnel until it is reconfigured.  Instead, an IKE daemon can
+    negotiate and rekey them, for a tunnel with ``options:esp_keying=ike``,
+    through the ``esp/sa-add`` and related commands of ``ovs-vswitchd``.  For
+    strongSwan, the ``kernel-ovs`` plugin, which is distributed separately,
+    does this::
 
-    * Keys are configured manually.  Key exchange (IKE) is not supported yet.
+        $ ovs-vsctl add-port br0 esp0 -- set int esp0 type=esp \
+                options:remote_ip=172.31.1.1 \
+                options:esp_keying=ike options:esp_if_id=7
+
+    with ``if_id_in = 7`` and ``if_id_out = 7`` in the strongSwan
+    connection.  Received packets then have 7 in ``tun_id``, and
+    ``ovs-appctl esp/show`` lists the security associations.
+
+    The current implementation has these restrictions:
 
     * Only tunnel mode.  ESP can be carried in UDP for NAT traversal
       (``options:esp_udp_encap=true``), but the peer's UDP port is not
