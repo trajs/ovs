@@ -2932,8 +2932,9 @@
             and authenticated with AES-GCM (RFC 4106) by the datapath
             itself, so the tunnel is only supported by the userspace
             datapath, e.g. with DPDK, and requires Open vSwitch to be built
-            with OpenSSL.  The security associations are configured with
-            ESP specific options.  It interoperates with other IPsec
+            with the Intel IPsec Multi-Buffer library or with OpenSSL.  The
+            security associations are configured with ESP specific options,
+            or by an IKE daemon.  It interoperates with other IPsec
             implementations, such as the Linux kernel's, in tunnel mode.
             </p>
           </dd>
