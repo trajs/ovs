@@ -746,6 +746,18 @@ ovs_print_version(uint8_t min_ofp, uint8_t max_ofp)
     }
 }
 
+/* Overwrites the 'n' bytes at 'p' with zeros, in a way the compiler does not
+ * optimize away, to erase secrets such as keys. */
+void
+ovs_memwipe(void *p, size_t n)
+{
+    volatile uint8_t *v = p;
+
+    while (n--) {
+        *v++ = 0;
+    }
+}
+
 /* Writes the 'size' bytes in 'buf' to 'stream' as hex bytes arranged 16 per
  * line.  Numeric offsets are also included, starting at 'ofs' for the first
  * byte in 'buf'.  If 'ascii' is true then the corresponding ASCII characters

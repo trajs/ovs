@@ -19,6 +19,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "compiler.h"
 
 struct dpif_netlink_vport;
@@ -46,6 +47,12 @@ enum { NETDEV_VPORT_NAME_BUFSIZE = 16 };
 
 const char *netdev_vport_get_dpif_port(const struct netdev *,
                                        char namebuf[], size_t bufsize)
+    OVS_WARN_UNUSED_RESULT;
+
+struct in6_addr;
+char *netdev_vport_esp_check_sa(uint32_t if_id, bool inbound,
+                                const struct in6_addr *src,
+                                const struct in6_addr *dst, bool encap)
     OVS_WARN_UNUSED_RESULT;
 
 #endif /* netdev-vport.h */

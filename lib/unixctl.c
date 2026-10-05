@@ -437,6 +437,21 @@ process_command(struct unixctl_conn *conn, struct jsonrpc_msg *request)
                         command->aux);
         }
 
+        if (command->sensitive) {
+            /* Erase the copies of the secrets that this function can reach. */
+            for (i = 0; i < argv.n; i++) {
+                ovs_memwipe(argv.names[i], strlen(argv.names[i]));
+            }
+            for (i = 0; i < n; i++) {
+                const struct json *elem = json_array_at(params, i);
+
+                if (elem->type == JSON_STRING) {
+                    char *s = CONST_CAST(char *, json_string(elem));
+
+                    ovs_memwipe(s, strlen(s));
+                }
+            }
+        }
         svec_destroy(&argv);
     }
 
