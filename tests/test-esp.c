@@ -49,6 +49,8 @@ make_params(uint32_t spi, const char *key, bool esn, uint16_t window)
 
     memset(&params, 0, sizeof params);
     params.spi = htonl(spi);
+    params.sad_id = params.spi;
+    params.tun_id = htonll(spi);
     params.esn = esn;
     params.replay_window = window;
     error = esp_parse_key(key, &params);
@@ -89,9 +91,9 @@ static int
 open_pkt(struct test_pkt *pkt, size_t *payload_len)
 {
     uint8_t next_hdr;
-    ovs_be32 spi;
+    ovs_be64 tun_id;
 
-    return esp_open(pkt_esp(pkt), pkt->len, &spi, &next_hdr, payload_len);
+    return esp_open(pkt_esp(pkt), pkt->len, &tun_id, &next_hdr, payload_len);
 }
 
 /* Seals a packet with sequence number 'seq' on 'out' and returns the result
@@ -138,8 +140,8 @@ test_known_answer(void)
     struct esp_sa *sa = esp_sa_create(&params);
     struct test_pkt pkt;
     uint8_t next_hdr;
+    ovs_be64 tun_id;
     size_t len;
-    ovs_be32 spi;
 
     ovs_assert(!esp_sad_insert(sa));
 
@@ -164,8 +166,8 @@ test_known_answer(void)
     ovs_assert(open_pkt(&pkt, &len) == EINVAL);
 
     from_hex(&pkt, kat_seq7);
-    ovs_assert(!esp_open(pkt_esp(&pkt), pkt.len, &spi, &next_hdr, &len));
-    ovs_assert(spi == htonl(0x1000));
+    ovs_assert(!esp_open(pkt_esp(&pkt), pkt.len, &tun_id, &next_hdr, &len));
+    ovs_assert(tun_id == htonll(0x1000));
     ovs_assert(next_hdr == 4);
     ovs_assert(len == strlen(TEST_PAYLOAD));
     ovs_assert(!memcmp(pkt.buf + ESP_PREFIX_LEN, TEST_PAYLOAD, len));
@@ -337,6 +339,34 @@ test_sad(void)
     ovs_assert(esp_sad_lookup(spi, &peer) == sa3);
     esp_sad_remove(sa3);
     ovs_assert(!esp_sad_lookup(spi, &peer));
+
+    /* An SA rekeyed by IKE is looked up by a stable ID, but packets carry its
+     * SPI, and received packets get its tunnel ID. */
+    struct esp_sa_params p4 = make_params(0x5000, TEST_KEY, false, 64);
+    struct esp_sa_params p5 = make_params(0x5000, TEST_KEY, false, 64);
+    struct esp_sa *out, *in;
+    struct test_pkt pkt;
+    ovs_be64 tun_id;
+    uint8_t next_hdr;
+    size_t len;
+
+    p4.sad_id = htonl(7);
+    p4.dst = peer;
+    p5.tun_id = htonll(7);
+    out = esp_sa_create(&p4);
+    in = esp_sa_create(&p5);
+    ovs_assert(!esp_sad_insert(out));
+    ovs_assert(!esp_sad_insert(in));
+    ovs_assert(esp_sad_lookup(htonl(7), &peer) == out);
+    ovs_assert(!esp_sad_lookup(htonl(0x5000), &peer));
+    ovs_assert(!seal(out, &pkt, "x", 1));
+    ovs_assert(get_16aligned_be32(&pkt_esp(&pkt)->spi) == htonl(0x5000));
+    ovs_assert(!esp_open(pkt_esp(&pkt), pkt.len, &tun_id, &next_hdr, &len));
+    ovs_assert(tun_id == htonll(7));
+    esp_sad_remove(out);
+    esp_sad_remove(in);
+    esp_sa_destroy(out);
+    esp_sa_destroy(in);
 
     esp_sa_destroy(sa1);
     esp_sa_destroy(sa2);

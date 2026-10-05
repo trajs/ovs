@@ -33,6 +33,7 @@
 #include "dirs.h"
 #include "dpif.h"
 #include "esp.h"
+#include "esp-ctl.h"
 #include "netdev.h"
 #include "netdev-native-tnl.h"
 #include "netdev-provider.h"
@@ -187,6 +188,8 @@ netdev_vport_route_changed(void)
     free(vports);
 }
 
+static void esp_tunnel_remove_sas(struct netdev_vport *);
+
 static struct netdev *
 netdev_vport_alloc(void)
 {
@@ -252,14 +255,7 @@ netdev_vport_destruct(struct netdev *netdev_)
         update_vxlan_global_cfg(netdev_, tnl_cfg, NULL);
     }
 
-    if (netdev->esp_in_sa) {
-        esp_sad_remove(netdev->esp_in_sa);
-        esp_sa_destroy_postponed(netdev->esp_in_sa);
-    }
-    if (netdev->esp_out_sa) {
-        esp_sad_remove(netdev->esp_out_sa);
-        esp_sa_destroy_postponed(netdev->esp_out_sa);
-    }
+    esp_tunnel_remove_sas(netdev);
 
     ovsrcu_set(&netdev->tnl_cfg, NULL);
     ovsrcu_postpone(free, CONST_CAST(struct netdev_tunnel_config *, tnl_cfg));
@@ -643,7 +639,53 @@ is_esp_option(const char *key)
     return (!strcmp(key, "esp_in_spi") || !strcmp(key, "esp_out_spi")
             || !strcmp(key, "esp_in_key") || !strcmp(key, "esp_out_key")
             || !strcmp(key, "esp_esn") || !strcmp(key, "esp_replay_window")
-            || !strcmp(key, "esp_udp_encap") || !strcmp(key, "esp_udp_port"));
+            || !strcmp(key, "esp_udp_encap") || !strcmp(key, "esp_udp_port")
+            || !strcmp(key, "esp_keying") || !strcmp(key, "esp_if_id"));
+}
+
+/* Completes 'tnl_cfg' for an esp tunnel whose security associations are
+ * installed by an IKE daemon through the "esp/sa-add" command, which binds
+ * them to the tunnel through 'esp_if_id'. */
+static int
+esp_tunnel_config_ike(struct netdev_vport *dev, const struct smap *args,
+                      struct netdev_tunnel_config *tnl_cfg, struct ds *errors)
+{
+    static const char *manual_options[] = {
+        "esp_in_spi", "esp_out_spi", "esp_in_key", "esp_out_key",
+        "esp_esn", "esp_replay_window",
+    };
+    const char *name = netdev_get_name(&dev->up);
+    unsigned long long int if_id;
+    const char *s;
+    char *tail;
+
+    for (size_t i = 0; i < ARRAY_SIZE(manual_options); i++) {
+        if (smap_get(args, manual_options[i])) {
+            ds_put_format(errors, "%s: '%s' is negotiated by IKE with "
+                          "'esp_keying=ike'\n", name, manual_options[i]);
+            return EINVAL;
+        }
+    }
+
+    s = smap_get(args, "esp_if_id");
+    errno = 0;
+    if_id = s ? strtoull(s, &tail, 0) : 0;
+    if (!s || errno || *tail || !if_id || if_id > UINT32_MAX) {
+        ds_put_format(errors, "%s: 'esp_keying=ike' requires 'esp_if_id' "
+                      "between 1 and 4294967295\n", name);
+        return EINVAL;
+    }
+
+    tnl_cfg->esp_ike = true;
+    tnl_cfg->esp_if_id = if_id;
+    tnl_cfg->esp_out_spi = htonl(if_id);
+
+    /* Received packets carry the interface ID as their tunnel ID, which
+     * stays the same when the SAs are rekeyed. */
+    tnl_cfg->in_key = tnl_cfg->out_key = htonll(if_id);
+    tnl_cfg->in_key_present = tnl_cfg->out_key_present = true;
+
+    return 0;
 }
 
 /* Parses the ESP options in 'args' for ESP tunnel 'dev', checks them against
@@ -684,6 +726,27 @@ esp_tunnel_config(struct netdev_vport *dev, const struct smap *args,
         return EINVAL;
     }
 
+    if (smap_get_bool(args, "esp_udp_encap", false)) {
+        unsigned int port = smap_get_uint(args, "esp_udp_port",
+                                          ESP_UDP_ENCAP_PORT);
+
+        if (!port || port > UINT16_MAX) {
+            ds_put_format(errors, "%s: 'esp_udp_port' must be between 1 "
+                          "and 65535\n", name);
+            return EINVAL;
+        }
+        tnl_cfg->dst_port = htons(port);
+    }
+
+    s = smap_get_def(args, "esp_keying", "manual");
+    if (!strcmp(s, "ike")) {
+        return esp_tunnel_config_ike(dev, args, tnl_cfg, errors);
+    } else if (strcmp(s, "manual")) {
+        ds_put_format(errors, "%s: 'esp_keying' must be 'manual' or 'ike'\n",
+                      name);
+        return EINVAL;
+    }
+
     memset(&in, 0, sizeof in);
     memset(&out, 0, sizeof out);
 
@@ -715,18 +778,6 @@ esp_tunnel_config(struct netdev_vport *dev, const struct smap *args,
         return EINVAL;
     }
 
-    if (smap_get_bool(args, "esp_udp_encap", false)) {
-        unsigned int port = smap_get_uint(args, "esp_udp_port",
-                                          ESP_UDP_ENCAP_PORT);
-
-        if (!port || port > UINT16_MAX) {
-            ds_put_format(errors, "%s: 'esp_udp_port' must be between 1 "
-                          "and 65535\n", name);
-            return EINVAL;
-        }
-        tnl_cfg->dst_port = htons(port);
-    }
-
     in.esn = out.esn = smap_get_bool(args, "esp_esn", false);
     in.replay_window = smap_get_uint(args, "esp_replay_window",
                                      ESP_DEFAULT_REPLAY_WINDOW);
@@ -741,15 +792,18 @@ esp_tunnel_config(struct netdev_vport *dev, const struct smap *args,
     /* An SA is identified by its SPI and, for outbound SAs, the peer's
      * address.  Two tunnels cannot share one. */
     out.dst = tnl_cfg->ipv6_dst;
+    in.sad_id = in.spi;
+    in.tun_id = htonll(ntohl(in.spi));
+    out.sad_id = out.spi;
     cur_in = dev->esp_in_sa;
-    other = esp_sad_lookup(in.spi, &in.dst);
+    other = esp_sad_lookup(in.sad_id, &in.dst);
     if (other && other != cur_in) {
         ds_put_format(errors, "%s: 'esp_in_spi' %"PRIu32" is already used "
                       "by another esp tunnel\n", name, ntohl(in.spi));
         return EEXIST;
     }
     cur_out = dev->esp_out_sa;
-    other = esp_sad_lookup(out.spi, &out.dst);
+    other = esp_sad_lookup(out.sad_id, &out.dst);
     if (other && other != cur_out) {
         ds_put_format(errors, "%s: 'esp_out_spi' %"PRIu32" is already used "
                       "by another esp tunnel to the same 'remote_ip'\n",
@@ -805,7 +859,7 @@ esp_tunnel_install_sa(struct esp_sa **cur, struct esp_sa *new)
     }
 
     new_p = esp_sa_get_params(new);
-    if (old && esp_sa_get_params(old)->spi == new_p->spi
+    if (old && esp_sa_get_params(old)->sad_id == new_p->sad_id
         && ipv6_addr_equals(&esp_sa_get_params(old)->dst, &new_p->dst)) {
         esp_sad_replace(old, new);
     } else {
@@ -818,32 +872,18 @@ esp_tunnel_install_sa(struct esp_sa **cur, struct esp_sa *new)
     esp_sa_destroy_postponed(old);
 }
 
+/* Removes the manually keyed SAs of 'dev', if any. */
 static void
-esp_show_sa(struct ds *ds, const char *dir, const struct esp_sa *sa,
-            bool inbound)
+esp_tunnel_remove_sas(struct netdev_vport *dev)
 {
-    const struct esp_sa_params *p = esp_sa_get_params(sa);
-    struct esp_sa_stats stats;
+    struct esp_sa **sas[] = { &dev->esp_in_sa, &dev->esp_out_sa };
 
-    esp_sa_get_stats(sa, &stats);
-    ds_put_format(ds, "  %s: spi 0x%08"PRIx32", %s, esn %s", dir,
-                  ntohl(p->spi), esp_sa_cipher_name(sa),
-                  p->esn ? "on" : "off");
-    if (inbound) {
-        ds_put_format(ds, ", replay window %"PRIu16"\n", p->replay_window);
-        ds_put_format(ds, "    packets %"PRIu64", bytes %"PRIu64,
-                      stats.n_packets, stats.n_bytes);
-        if (p->replay_window) {
-            ds_put_format(ds, ", highest seq %"PRIu64, stats.rx_seq);
+    for (size_t i = 0; i < ARRAY_SIZE(sas); i++) {
+        if (*sas[i]) {
+            esp_sad_remove(*sas[i]);
+            esp_sa_destroy_postponed(*sas[i]);
+            *sas[i] = NULL;
         }
-        ds_put_format(ds, "\n    replayed %"PRIu64", auth failed %"PRIu64
-                      ", malformed %"PRIu64"\n", stats.n_replayed,
-                      stats.n_auth_failed, stats.n_malformed);
-    } else {
-        ds_put_format(ds, "\n    packets %"PRIu64", bytes %"PRIu64
-                      ", last seq %"PRIu64", errors %"PRIu64"\n",
-                      stats.n_packets, stats.n_bytes, stats.tx_seq,
-                      stats.n_tx_errors);
     }
 }
 
@@ -877,15 +917,20 @@ netdev_vport_esp_show(struct unixctl_conn *conn, int argc,
         }
 
         ovs_mutex_lock(&dev->mutex);
-        if (dev->esp_in_sa && dev->esp_out_sa) {
-            const struct netdev_tunnel_config *tnl_cfg;
-
-            tnl_cfg = vport_tunnel_config(dev);
+        const struct netdev_tunnel_config *tnl_cfg = vport_tunnel_config(dev);
+        if (tnl_cfg->esp_ike) {
+            ds_put_format(&ds, "%s: remote ", name);
+            ipv6_format_mapped(&tnl_cfg->ipv6_dst, &ds);
+            ds_put_format(&ds, ", keyed by IKE, if_id %"PRIu32"\n",
+                          tnl_cfg->esp_if_id);
+            esp_ctl_format(&ds, tnl_cfg->esp_if_id);
+            found = true;
+        } else if (dev->esp_in_sa && dev->esp_out_sa) {
             ds_put_format(&ds, "%s: remote ", name);
             ipv6_format_mapped(&tnl_cfg->ipv6_dst, &ds);
             ds_put_char(&ds, '\n');
-            esp_show_sa(&ds, "outbound", dev->esp_out_sa, false);
-            esp_show_sa(&ds, "inbound ", dev->esp_in_sa, true);
+            esp_sa_format(&ds, "outbound", dev->esp_out_sa, false);
+            esp_sa_format(&ds, "inbound ", dev->esp_in_sa, true);
             found = true;
         }
         ovs_mutex_unlock(&dev->mutex);
@@ -1240,6 +1285,9 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args, char **errp)
 
     ovs_mutex_lock(&dev->mutex);
 
+    if (tnl_cfg.esp_ike) {
+        esp_tunnel_remove_sas(dev);
+    }
     esp_tunnel_install_sa(&dev->esp_in_sa, esp_in);
     esp_tunnel_install_sa(&dev->esp_out_sa, esp_out);
 
@@ -1297,7 +1345,17 @@ get_tunnel_config(const struct netdev *dev, struct smap *args)
         smap_add(args, "local_ip", "flow");
     }
 
-    if (!strcmp(type, "esp")) {
+    if (!strcmp(type, "esp") && tnl_cfg->esp_ike) {
+        smap_add(args, "esp_keying", "ike");
+        smap_add_format(args, "esp_if_id", "%"PRIu32, tnl_cfg->esp_if_id);
+        if (tnl_cfg->dst_port) {
+            smap_add(args, "esp_udp_encap", "true");
+            if (ntohs(tnl_cfg->dst_port) != ESP_UDP_ENCAP_PORT) {
+                smap_add_format(args, "esp_udp_port", "%"PRIu16,
+                                ntohs(tnl_cfg->dst_port));
+            }
+        }
+    } else if (!strcmp(type, "esp")) {
         /* The keys are derived from the SPIs.  The ESP keys are secret. */
         smap_add_format(args, "esp_in_spi", "%"PRIu32,
                         ntohl(tnl_cfg->esp_in_spi));
@@ -1726,6 +1784,7 @@ netdev_vport_tunnel_register(void)
                                  netdev_tnl_egress_port_range, NULL);
         unixctl_command_register("esp/show", "[port]", 0, 1,
                                  netdev_vport_esp_show, NULL);
+        esp_ctl_init();
 
         ovsthread_once_done(&once);
     }

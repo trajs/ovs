@@ -60,8 +60,19 @@
 #define ESP_MAX_REPLAY_WINDOW     4096
 
 struct esp_sa_params {
-    ovs_be32 spi;
+    ovs_be32 spi;                   /* SPI in the packets. */
     struct in6_addr dst;            /* Outbound: peer address.  Inbound: 0. */
+
+    /* An SA is found in the SAD by 'sad_id' and 'dst'.  For an inbound SA,
+     * 'sad_id' is the SPI.  For an outbound SA, it is the SPI in the tunnel
+     * header that the datapath pushes: the SPI itself for a manually keyed
+     * tunnel, or a stable ID for a tunnel whose SAs are rekeyed by IKE, so
+     * that a new SA can replace the old one without changing datapath flows.
+     *
+     * Received packets get 'tun_id' as their tunnel ID. */
+    ovs_be32 sad_id;
+    ovs_be64 tun_id;
+
     uint8_t key[ESP_MAX_KEY_LEN];   /* AES key followed by the salt. */
     uint8_t key_len;                /* Including the salt. */
     bool esn;                       /* Extended (64-bit) Sequence Numbers. */
@@ -95,15 +106,19 @@ struct esp_sa_stats {
 };
 void esp_sa_get_stats(const struct esp_sa *, struct esp_sa_stats *);
 
+struct ds;
+void esp_sa_format(struct ds *, const char *dir, const struct esp_sa *,
+                   bool inbound);
+
 int esp_sad_insert(struct esp_sa *);
 void esp_sad_replace(struct esp_sa *old, struct esp_sa *new);
 void esp_sad_remove(struct esp_sa *);
-struct esp_sa *esp_sad_lookup(ovs_be32 spi, const struct in6_addr *dst);
+struct esp_sa *esp_sad_lookup(ovs_be32 sad_id, const struct in6_addr *dst);
 
 size_t esp_trailer_len(size_t payload_len);
 int esp_seal(struct esp_sa *, struct esp_header *, size_t payload_len,
              uint8_t next_hdr);
-int esp_open(struct esp_header *, size_t len, ovs_be32 *spi,
+int esp_open(struct esp_header *, size_t len, ovs_be64 *tun_id,
              uint8_t *next_hdr, size_t *payload_len);
 
 /* For testing only. */

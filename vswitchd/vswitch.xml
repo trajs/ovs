@@ -3390,6 +3390,46 @@
         that a restart does not reuse the GCM nonces.
       </p>
 
+      <column name="options" key="esp_keying"
+              type='{"type": "string", "enum": ["set", ["manual", "ike"]]}'>
+        <p>
+          Optional.  How the security associations of the tunnel are
+          configured:
+        </p>
+        <dl>
+          <dt><code>manual</code> (the default)</dt>
+          <dd>
+            With the <code>esp_in_*</code> and <code>esp_out_*</code> options
+            below.
+          </dd>
+          <dt><code>ike</code></dt>
+          <dd>
+            By an IKE daemon, such as strongSwan with its
+            <code>kernel-ovs</code> plugin, through the
+            <code>esp/sa-add</code> and related commands of
+            <code>ovs-vswitchd</code>(8).  The daemon negotiates the keys and
+            rekeys the security associations, which it binds to the tunnel
+            with <ref column="options" key="esp_if_id"/>.  The
+            <code>esp_in_*</code>, <code>esp_out_*</code>, <code>esp_esn</code>
+            and <code>esp_replay_window</code> options are not allowed.
+          </dd>
+        </dl>
+      </column>
+
+      <column name="options" key="esp_if_id"
+              type='{"type": "integer", "minInteger": 1,
+                     "maxInteger": 4294967295}'>
+        <p>
+          Required with <code>esp_keying=ike</code>.  The interface ID of the
+          IKE daemon's security associations for this tunnel, e.g.
+          <code>if_id_in</code> and <code>if_id_out</code> in strongSwan's
+          configuration.  Received packets have it in the
+          <code>tun_id</code> field, and datapath flows show it as the SPI
+          of the pushed ESP header, the SPI of the current security
+          association being written into each packet.
+        </p>
+      </column>
+
       <column name="options" key="esp_in_spi">
         <p>
           Required.  The Security Parameters Index (SPI) of received packets,

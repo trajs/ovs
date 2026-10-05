@@ -27,6 +27,7 @@
 #include "cmap.h"
 #include "coverage.h"
 #include "hash.h"
+#include "openvswitch/dynamic-string.h"
 #include "ovs-atomic.h"
 #include "ovs-rcu.h"
 #include "ovs-thread.h"
@@ -140,6 +141,8 @@ esp_sa_params_equal(const struct esp_sa_params *a,
 {
     return (a->spi == b->spi
             && ipv6_addr_equals(&a->dst, &b->dst)
+            && a->sad_id == b->sad_id
+            && a->tun_id == b->tun_id
             && a->key_len == b->key_len
             && !memcmp(a->key, b->key, a->key_len)
             && a->esn == b->esn
@@ -270,6 +273,37 @@ esp_sa_get_stats(const struct esp_sa *sa_, struct esp_sa_stats *stats)
     ovs_mutex_unlock(&sa->replay_mutex);
 }
 
+/* Appends to 'ds' a description of 'sa', labeled 'dir', and its
+ * statistics. */
+void
+esp_sa_format(struct ds *ds, const char *dir, const struct esp_sa *sa,
+              bool inbound)
+{
+    const struct esp_sa_params *p = esp_sa_get_params(sa);
+    struct esp_sa_stats stats;
+
+    esp_sa_get_stats(sa, &stats);
+    ds_put_format(ds, "  %s: spi 0x%08"PRIx32", %s, esn %s", dir,
+                  ntohl(p->spi), esp_sa_cipher_name(sa),
+                  p->esn ? "on" : "off");
+    if (inbound) {
+        ds_put_format(ds, ", replay window %"PRIu16"\n", p->replay_window);
+        ds_put_format(ds, "    packets %"PRIu64", bytes %"PRIu64,
+                      stats.n_packets, stats.n_bytes);
+        if (p->replay_window) {
+            ds_put_format(ds, ", highest seq %"PRIu64, stats.rx_seq);
+        }
+        ds_put_format(ds, "\n    replayed %"PRIu64", auth failed %"PRIu64
+                      ", malformed %"PRIu64"\n", stats.n_replayed,
+                      stats.n_auth_failed, stats.n_malformed);
+    } else {
+        ds_put_format(ds, "\n    packets %"PRIu64", bytes %"PRIu64
+                      ", last seq %"PRIu64", errors %"PRIu64"\n",
+                      stats.n_packets, stats.n_bytes, stats.tx_seq,
+                      stats.n_tx_errors);
+    }
+}
+
 /* Returns the name of the cipher of 'sa', e.g. "aes128-gcm16". */
 const char *
 esp_sa_cipher_name(const struct esp_sa *sa)
@@ -309,10 +343,10 @@ esp_sad_insert(struct esp_sa *sa)
 {
     const struct esp_sa_params *p = &sa->params;
 
-    if (esp_sad_lookup(p->spi, &p->dst)) {
+    if (esp_sad_lookup(p->sad_id, &p->dst)) {
         return EEXIST;
     }
-    cmap_insert(&esp_sad, &sa->node, esp_sad_hash(p->spi, &p->dst));
+    cmap_insert(&esp_sad, &sa->node, esp_sad_hash(p->sad_id, &p->dst));
     return 0;
 }
 
@@ -324,10 +358,10 @@ esp_sad_replace(struct esp_sa *old, struct esp_sa *new)
 {
     const struct esp_sa_params *p = &new->params;
 
-    ovs_assert(old->params.spi == p->spi
+    ovs_assert(old->params.sad_id == p->sad_id
                && ipv6_addr_equals(&old->params.dst, &p->dst));
     cmap_replace(&esp_sad, &old->node, &new->node,
-                 esp_sad_hash(p->spi, &p->dst));
+                 esp_sad_hash(p->sad_id, &p->dst));
 }
 
 void
@@ -335,18 +369,20 @@ esp_sad_remove(struct esp_sa *sa)
 {
     const struct esp_sa_params *p = &sa->params;
 
-    cmap_remove(&esp_sad, &sa->node, esp_sad_hash(p->spi, &p->dst));
+    cmap_remove(&esp_sad, &sa->node, esp_sad_hash(p->sad_id, &p->dst));
 }
 
-/* Returns the SA with 'spi' and 'dst' from the SAD, or NULL.  'dst' is the
- * peer's address for an outbound SA, all-zeros for an inbound SA. */
+/* Returns the SA with 'sad_id' and 'dst' from the SAD, or NULL.  'dst' is
+ * the peer's address for an outbound SA, all-zeros for an inbound SA.  See
+ * struct esp_sa_params for the meaning of 'sad_id'. */
 struct esp_sa *
-esp_sad_lookup(ovs_be32 spi, const struct in6_addr *dst)
+esp_sad_lookup(ovs_be32 sad_id, const struct in6_addr *dst)
 {
     struct esp_sa *sa;
 
-    CMAP_FOR_EACH_WITH_HASH (sa, node, esp_sad_hash(spi, dst), &esp_sad) {
-        if (sa->params.spi == spi && ipv6_addr_equals(&sa->params.dst, dst)) {
+    CMAP_FOR_EACH_WITH_HASH (sa, node, esp_sad_hash(sad_id, dst), &esp_sad) {
+        if (sa->params.sad_id == sad_id
+            && ipv6_addr_equals(&sa->params.dst, dst)) {
             return sa;
         }
     }
@@ -665,14 +701,15 @@ esp_seal(struct esp_sa *sa OVS_UNUSED_WITHOUT_OPENSSL,
  * using the inbound SA for its SPI, and checks it against the SA's
  * anti-replay window.
  *
- * If successful, stores the SPI in '*spi', the protocol of the payload in
+ * If successful, stores the SA's tunnel ID in '*tun_id', the protocol of the
+ * payload in
  * '*next_hdr' and its length in '*payload_len', and returns 0.  The payload
  * starts ESP_PREFIX_LEN bytes after 'esp'.  Otherwise, returns a positive
  * errno value. */
 int
 esp_open(struct esp_header *esp OVS_UNUSED_WITHOUT_OPENSSL,
          size_t len OVS_UNUSED_WITHOUT_OPENSSL,
-         ovs_be32 *spi OVS_UNUSED_WITHOUT_OPENSSL,
+         ovs_be64 *tun_id OVS_UNUSED_WITHOUT_OPENSSL,
          uint8_t *next_hdr OVS_UNUSED_WITHOUT_OPENSSL,
          size_t *payload_len OVS_UNUSED_WITHOUT_OPENSSL)
 {
@@ -697,8 +734,7 @@ esp_open(struct esp_header *esp OVS_UNUSED_WITHOUT_OPENSSL,
     }
     ct_len = len - ESP_PREFIX_LEN - ESP_ICV_LEN;
 
-    *spi = get_16aligned_be32(&esp->spi);
-    sa = esp_sad_lookup(*spi, &in6addr_any);
+    sa = esp_sad_lookup(get_16aligned_be32(&esp->spi), &in6addr_any);
     if (OVS_UNLIKELY(!sa)) {
         COVERAGE_INC(esp_rx_no_sa);
         return ENOENT;
@@ -747,6 +783,7 @@ esp_open(struct esp_header *esp OVS_UNUSED_WITHOUT_OPENSSL,
         }
     }
 
+    *tun_id = sa->params.tun_id;
     *next_hdr = trailer[1];
     *payload_len = ct_len - pad_len - ESP_TRAILER_LEN;
     esp_stat_inc(&sa->n_packets, 1);

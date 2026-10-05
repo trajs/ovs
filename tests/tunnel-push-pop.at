@@ -1840,8 +1840,8 @@ aa55aa550001aa55aa55000008004500009c000040004011339c010102580101025c119411940088
 
 dnl Decapsulation of a packet encrypted by an independent implementation.
 m4_define([ESP_IN_UDP], [aa55aa550000aa55aa55000108004500006800004000401133d00101025c01010258119411940054000000001000000000010102030405060708319779ecb7385859a48de241704608a2b76f467926ada1846103e4f0c011b294f83a80b9ba98e1cfbfd7b9421e33c5e1a7d8e84de7b0d2a39cfc4887])
-m4_define([IKE], [aa55aa550000aa55aa55000108004500003c00004000401133fc0101025c01010258119411940028000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b])
-m4_define([KEEPALIVE], [aa55aa550000aa55aa55000108004500001d000040004011341b0101025c010102581194119400090000ff])
+m4_define([NATT_IKE_PKT], [aa55aa550000aa55aa55000108004500003c00004000401133fc0101025c01010258119411940028000000000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b])
+m4_define([NATT_KEEPALIVE_PKT], [aa55aa550000aa55aa55000108004500001d000040004011341b0101025c010102581194119400090000ff])
 
 AT_CHECK([ovs-appctl netdev-dummy/receive p0 ESP_IN_UDP])
 OVS_WAIT_UNTIL([test $(ovs-pcap p1.pcap | wc -l) -ge 1])
@@ -1851,8 +1851,8 @@ AT_CHECK([ovs-pcap p1.pcap], [0], [dnl
 
 dnl IKE packets, which start with a zero non-ESP marker, and NAT keepalives
 dnl are not decrypted.
-AT_CHECK([ovs-appctl netdev-dummy/receive p0 IKE])
-AT_CHECK([ovs-appctl netdev-dummy/receive p0 KEEPALIVE])
+AT_CHECK([ovs-appctl netdev-dummy/receive p0 NATT_IKE_PKT])
+AT_CHECK([ovs-appctl netdev-dummy/receive p0 NATT_KEEPALIVE_PKT])
 OVS_WAIT_UNTIL([test $(ovs-appctl coverage/read-counter native_tnl_esp_natt_keepalive) = 1])
 AT_CHECK([ovs-appctl coverage/read-counter native_tnl_esp_natt_non_esp], [0], [1
 ])
@@ -1873,4 +1873,137 @@ esp_sys (X) ref_cnt=1
 
 dnl A datapath flow from the old port may be revalidated meanwhile.
 OVS_VSWITCHD_STOP(["/receive tunnel port not found/d"])
+AT_CLEANUP
+
+AT_SETUP([tunnel_push_pop - esp keyed by IKE])
+AT_KEYWORDS([ipsec])
+AT_SKIP_IF([test "$HAVE_OPENSSL" = no])
+
+m4_define([KEY_IN], [0x101112131415161718191a1b1c1d1e1fcafebabe])
+m4_define([KEY_OUT], [0x202122232425262728292a2b2c2d2e2fdeadbeef])
+
+OVS_VSWITCHD_START([add-port br0 p0 -- set Interface p0 type=dummy dnl
+                    ofport_request=1 other-config:hwaddr=aa:55:aa:55:00:00 dnl
+                    options:tx_pcap=p0.pcap])
+AT_CHECK([ovs-vsctl add-br int-br -- set bridge int-br datapath_type=dummy])
+AT_CHECK([ovs-vsctl add-port int-br t1 -- set Interface t1 type=esp dnl
+            ofport_request=2 options:remote_ip=1.1.2.92 dnl
+            options:esp_keying=ike options:esp_if_id=7 dnl
+            -- add-port int-br p1 -- set Interface p1 type=dummy dnl
+            ofport_request=3 options:tx_pcap=p1.pcap])
+AT_CHECK([ovs-appctl dpif/show | grep t1 | sed 's|2/[[0-9]]*|2/X|'], [0], [dnl
+    t1 2/X: (esp: esp_if_id=7, esp_keying=ike, remote_ip=1.1.2.92)
+])
+
+AT_CHECK([ovs-appctl netdev-dummy/ip4addr br0 1.1.2.88/24], [0], [OK
+])
+AT_CHECK([ovs-appctl tnl/neigh/set br0 1.1.2.92 aa:55:aa:55:00:01], [0], [OK
+])
+AT_CHECK([ovs-ofctl add-flow br0 action=normal])
+AT_CHECK([ovs-ofctl add-flow int-br in_port=t1,action=p1])
+AT_CHECK([ovs-ofctl add-flow int-br in_port=p1,action=t1])
+
+dnl What an IKE daemon does: allocate an SPI and install the SAs.
+AT_CHECK([ovs-appctl esp/spi-alloc | grep -c '^0xc[[0-9a-f]]\{7\}$'], [0], [1
+])
+AT_CHECK([ovs-appctl esp/sa-add dir=in spi=0x1000 src=1.1.2.92 dnl
+            dst=1.1.2.88 if_id=7 key=KEY_IN])
+AT_CHECK([ovs-appctl esp/sa-add dir=out spi=0x2000 src=1.1.2.88 dnl
+            dst=1.1.2.92 if_id=7 key=KEY_OUT])
+AT_CHECK([ovs-appctl esp/sa-add dir=in spi=0x1000 src=1.1.2.92 dnl
+            dst=1.1.2.88 if_id=7 key=KEY_IN], [2], [], [dnl
+SA already exists
+ovs-appctl: ovs-vswitchd: server returned an error
+])
+
+dnl The keys are not logged.
+AT_CHECK([grep -c 'esp/sa-add\[[<hidden>\]]' ovs-vswitchd.log], [0], [3
+])
+AT_CHECK([grep -c '101112131415\|202122232425' ovs-vswitchd.log], [1], [0
+])
+
+dnl Encapsulation.  The pushed header carries the interface ID, by which the
+dnl outbound SA is found, and the packets carry the SA's SPI.
+m4_define([INNER_FLOW], [eth(src=f8:bc:12:44:34:b6,dst=aa:55:aa:55:00:00),eth_type(0x0800),ipv4(src=10.0.0.1,dst=10.0.0.2,proto=17,tos=0,ttl=64,frag=no),udp(src=100,dst=200)])
+AT_CHECK([ovs-appctl ofproto/trace --names int-br dnl
+            in_port=p1,dl_src=f8:bc:12:44:34:b6,dl_dst=aa:55:aa:55:00:00,dnl
+udp,nw_src=10.0.0.1,nw_dst=10.0.0.2,nw_ttl=64,udp_src=100,udp_dst=200],
+         [0], [stdout])
+AT_CHECK([tail -1 stdout | grep -o 'esp(spi=[[^)]]*)'], [0], [dnl
+esp(spi=0x7)
+])
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 'INNER_FLOW'])
+OVS_WAIT_UNTIL([test $(ovs-pcap p0.pcap | wc -l) -ge 1])
+AT_CHECK([ovs-pcap p0.pcap | cut -c69-84], [0], [dnl
+0000200000000001
+])
+
+dnl Decapsulation of a packet encrypted by an independent implementation with
+dnl KEY_IN, SPI 0x1000 and sequence number 1.  Its tunnel ID is the interface
+dnl ID.
+m4_define([ESP_SEQ1], [aa55aa550000aa55aa55000108004500006000004000403233b70101025c0101025800001000000000010102030405060708319779ecb7385859a48de241704608a2b76f467926ada1846103e4f0c011b294f83a80b9ba98e1cfbfd7b9421e33c5e1a7d8e84de7b0d2a39cfc4887])
+AT_CHECK([ovs-appctl netdev-dummy/receive p0 ESP_SEQ1])
+OVS_WAIT_UNTIL([test $(ovs-pcap p1.pcap | wc -l) -ge 1])
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep -c 'tun_id=0x7,'], [0], [1
+])
+
+AT_CHECK([ovs-appctl esp/sa-query dir=out spi=0x2000 dst=1.1.2.92], [0], [dnl
+packets=1 bytes=92
+])
+AT_CHECK([ovs-appctl esp/sa-query dir=in spi=0x1000 dst=1.1.2.88], [0], [dnl
+packets=1 bytes=40
+])
+
+dnl Rekeying.  The new outbound SA takes over without changing the datapath
+dnl flows, and the old one waits on standby until it is deleted.
+AT_CHECK([ovs-appctl esp/sa-add dir=in spi=0x1001 src=1.1.2.92 dnl
+            dst=1.1.2.88 if_id=7 key=KEY_IN])
+AT_CHECK([ovs-appctl esp/sa-add dir=out spi=0x3000 src=1.1.2.88 dnl
+            dst=1.1.2.92 if_id=7 key=KEY_OUT])
+AT_CHECK([ovs-appctl esp/show t1 | grep spi], [0], [dnl
+  outbound (standby): spi 0x00002000, aes128-gcm16, esn off
+  outbound: spi 0x00003000, aes128-gcm16, esn off
+  inbound : spi 0x00001000, aes128-gcm16, esn off, replay window 64
+  inbound : spi 0x00001001, aes128-gcm16, esn off, replay window 64
+])
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 'INNER_FLOW'])
+OVS_WAIT_UNTIL([test $(ovs-pcap p0.pcap | wc -l) -ge 2])
+AT_CHECK([ovs-pcap p0.pcap | tail -1 | cut -c69-84], [0], [dnl
+0000300000000001
+])
+
+AT_CHECK([ovs-appctl esp/sa-del dir=out spi=0x2000 dst=1.1.2.92])
+AT_CHECK([ovs-appctl esp/sa-del dir=in spi=0x1000 dst=1.1.2.88])
+AT_CHECK([ovs-appctl esp/sa-del dir=in spi=0x1000 dst=1.1.2.88], [2], [], [dnl
+no such SA
+ovs-appctl: ovs-vswitchd: server returned an error
+])
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 'INNER_FLOW'])
+OVS_WAIT_UNTIL([test $(ovs-pcap p0.pcap | wc -l) -ge 3])
+AT_CHECK([ovs-pcap p0.pcap | tail -1 | cut -c69-84], [0], [dnl
+0000300000000002
+])
+
+dnl A packet for the deleted inbound SA is dropped.
+AT_CHECK([ovs-appctl netdev-dummy/receive p0 ESP_SEQ1])
+OVS_WAIT_UNTIL([test $(ovs-appctl coverage/read-counter esp_rx_no_sa) -ge 1])
+
+AT_CHECK([ovs-appctl esp/sa-flush])
+AT_CHECK([ovs-appctl esp/show t1], [0], [dnl
+t1: remote 1.1.2.92, keyed by IKE, if_id 7
+])
+
+dnl Configuration errors.
+AT_CHECK([ovs-vsctl set Interface t1 options:esp_in_key=KEY_IN], [0], [],
+         [ignore])
+AT_CHECK([grep -q "t1: 'esp_in_key' is negotiated by IKE" ovs-vswitchd.log])
+AT_CHECK([ovs-vsctl remove Interface t1 options esp_in_key esp_if_id], [0], [],
+         [ignore])
+AT_CHECK([grep -q "t1: 'esp_keying=ike' requires 'esp_if_id'" dnl
+            ovs-vswitchd.log])
+
+OVS_VSWITCHD_STOP(["/is negotiated by IKE/d
+/requires 'esp_if_id'/d
+/could not set configuration/d
+/receive tunnel port not found/d"])
 AT_CLEANUP

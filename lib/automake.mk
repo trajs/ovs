@@ -106,6 +106,8 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/entropy.h \
 	lib/esp.c \
 	lib/esp.h \
+	lib/esp-ctl.c \
+	lib/esp-ctl.h \
 	lib/fat-rwlock.c \
 	lib/fat-rwlock.h \
 	lib/fatal-signal.c \

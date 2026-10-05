@@ -1139,8 +1139,9 @@ netdev_esp_build_header(const struct netdev *netdev,
         esp = netdev_tnl_ip_build_header(data, params, IPPROTO_ESP, 0);
     }
 
-    /* netdev_esp_push_header() finds the outbound SA from this SPI and the
-     * destination address, and fills in the rest of the ESP header. */
+    /* netdev_esp_push_header() finds the outbound SA from this SPI, which is
+     * the SA's 'sad_id', and the destination address.  esp_seal() then
+     * writes the SA's actual SPI and the rest of the ESP header. */
     put_16aligned_be32(&esp->spi, tnl_cfg->esp_out_spi);
     put_16aligned_be32(&esp->seq_no, 0);
     memset(esp + 1, 0, ESP_IV_LEN);
@@ -1185,7 +1186,7 @@ netdev_esp_push_header(const struct netdev *netdev,
                                    &ip_tot_size, 0);
 
     /* 'netdev' is the datapath port shared by all esp tunnels, so find the
-     * outbound SA from the SPI and destination in the header. */
+     * outbound SA from the SPI ('sad_id') and destination in the header. */
     if (netdev_tnl_is_header_ipv6(data->header)) {
         const struct ovs_16aligned_ip6_hdr *ip6 = dp_packet_l3(packet);
 
@@ -1233,7 +1234,7 @@ netdev_esp_pop_header(struct dp_packet *packet)
     unsigned int hlen;
     uint8_t next_hdr;
     uint8_t nw_proto;
-    ovs_be32 spi;
+    ovs_be64 tun_id;
     void *l4;
 
     pkt_metadata_init_tnl(md);
@@ -1282,7 +1283,7 @@ netdev_esp_pop_header(struct dp_packet *packet)
         esp = l4;
     }
 
-    if (esp_open(esp, esp_len, &spi, &next_hdr, &payload_len)) {
+    if (esp_open(esp, esp_len, &tun_id, &next_hdr, &payload_len)) {
         goto err;
     }
 
@@ -1296,7 +1297,7 @@ netdev_esp_pop_header(struct dp_packet *packet)
         goto err;
     }
 
-    tnl->tun_id = htonll(ntohl(spi));
+    tnl->tun_id = tun_id;
     tnl->flags |= FLOW_TNL_F_KEY;
 
     dp_packet_reset_packet(packet, hlen + ESP_PREFIX_LEN);

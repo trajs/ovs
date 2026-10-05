@@ -85,3 +85,20 @@ the number of packets and bytes sent or received through each.  For
 inbound security associations, it also shows the number of packets
 dropped as replays, because they failed authentication, or because
 they were malformed.  The byte counts are of the inner packets.
+.
+.IP "\fBesp/spi-alloc\fR"
+.IQ "\fBesp/sa-add dir=\fR{\fBin\fR|\fBout\fR} \fBspi=\fIspi\fR \fBsrc=\fIip\fR \fBdst=\fIip\fR \fBif_id=\fIid\fR \fBkey=\fIkey\fR [\fBesn=yes\fR] [\fBreplay=\fIn\fR] [\fBencap=yes\fR]"
+.IQ "\fBesp/sa-del dir=\fR{\fBin\fR|\fBout\fR} \fBspi=\fIspi\fR \fBdst=\fIip\fR"
+.IQ "\fBesp/sa-query dir=\fR{\fBin\fR|\fBout\fR} \fBspi=\fIspi\fR \fBdst=\fIip\fR"
+.IQ "\fBesp/sa-flush\fR"
+Interface for an IKE daemon, such as strongSwan with its
+\fBkernel-ovs\fR plugin, to manage the security associations of
+\fBesp\fR tunnels with \fBoptions:esp_keying=ike\fR.  \fBesp/spi-alloc\fR
+returns an unused SPI for an inbound security association.
+\fBesp/sa-add\fR installs a security association for the tunnel whose
+\fBoptions:esp_if_id\fR is \fIid\fR, with an AES-GCM \fIkey\fR followed
+by its 4-byte salt, in hexadecimal.  A new outbound security association
+for a tunnel replaces the previous one, which remains until it is
+deleted.  Its arguments are not logged.  \fBesp/sa-del\fR deletes a
+security association, \fBesp/sa-query\fR prints the numbers of packets
+and bytes it processed, and \fBesp/sa-flush\fR deletes all of them.

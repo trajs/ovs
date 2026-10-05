@@ -8,6 +8,10 @@ Post-v4.0.0
        of 'esp' tunnels and their statistics.
      * 'esp' tunnels support UDP encapsulation for NAT traversal, and TCP
        segmentation in software when userspace TSO is enabled.
+     * 'esp' tunnels with 'esp_keying=ike' get their security associations
+       from an IKE daemon, such as strongSwan with a 'kernel-ovs' plugin,
+       through new 'esp/sa-add', 'esp/sa-del', 'esp/sa-query',
+       'esp/sa-flush' and 'esp/spi-alloc' unixctl commands.
 
 v4.0.0 - 17 Aug 2026
 --------------------
