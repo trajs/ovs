@@ -178,8 +178,12 @@ struct netdev_tunnel_config {
     enum netdev_srv6_flowlabel srv6_flowlabel;
 
     /* ESP.  The keys are only kept in the tunnel's security associations. */
+    bool esp_ike;               /* SAs are installed by an IKE daemon. */
+    uint32_t esp_if_id;         /* With 'esp_ike', binds SAs to the tunnel. */
     ovs_be32 esp_in_spi;
-    ovs_be32 esp_out_spi;
+    ovs_be32 esp_out_spi;       /* SPI, or 'esp_if_id' with 'esp_ike', in the
+                                 * pushed header: the outbound SA's
+                                 * 'sad_id'. */
     bool esp_esn;
     uint16_t esp_replay_window;
 };
