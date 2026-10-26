@@ -22,7 +22,6 @@
 
 #include "coverage.h"
 #include "openvswitch/dynamic-string.h"
-#include "openvswitch/poll-loop.h"
 #include "openvswitch/vlog.h"
 #include "ovs-thread.h"
 #include "packets.h"
@@ -32,63 +31,27 @@
 
 VLOG_DEFINE_THIS_MODULE(conntrack_log);
 
-COVERAGE_DEFINE(conntrack_log_dropped);
+/* The only way a line is ever skipped: the per-second output budget is
+ * spent.  There is no ring to overflow any more, so there is no separate
+ * "dropped" counter -- this one covers every skipped line. */
 COVERAGE_DEFINE(conntrack_log_ratelimited);
 
-/* Per-thread ring size; must be a power of two.  Each slot is 120 bytes, so a
- * ring takes about 2 MB.  A ring is allocated the first time a thread logs an
- * event, and there can be at most CT_LOG_MAX_RINGS of them. */
-#define CT_LOG_RING_SIZE 16384
-#define CT_LOG_RING_MASK (CT_LOG_RING_SIZE - 1)
-BUILD_ASSERT_DECL(IS_POW2(CT_LOG_RING_SIZE));
-#define CT_LOG_MAX_RINGS 128
-
-#define CT_LOG_DRAIN_INTERVAL_MS 10
-
-/* Events are emitted in timestamp order.  Since they come from several rings,
- * an event is held back this long after its timestamp, to give events with
- * an earlier timestamp that are still in flight (e.g. the NEW event of a very
- * short-lived connection, whose DESTROY was logged by another thread) time to
- * show up. */
-#define CT_LOG_HOLD_MS 20
-
-struct ct_log_event {
-    long long ts_msec;          /* Wall clock time of the event. */
-    long long age_msec;         /* Time since creation (DESTROY only). */
-    struct conn_key orig;
-    struct conn_key reply;
-    uint32_t mark;
-    uint16_t nat_action;
-    uint8_t type;               /* enum ct_log_event_type. */
-    uint8_t reason;             /* enum ct_log_reason. */
-};
-
-/* Single-producer, single-consumer ring.  Each logging thread owns one ring
- * (as its only producer) and the 'ct_log' thread is the only consumer of all
- * of them, so no atomic read-modify-write is needed and there is no
- * contention between producers. */
-struct ct_log_ring {
-    PADDED_MEMBERS(CACHE_LINE_SIZE, atomic_uint32_t tail;);  /* Producer. */
-    PADDED_MEMBERS(CACHE_LINE_SIZE, atomic_uint32_t head;);  /* Consumer. */
-    atomic_bool in_use;            /* Owned by a live thread. */
-    struct ct_log_event slots[CT_LOG_RING_SIZE];
-};
-
-atomic_uint conntrack_log_mask = ATOMIC_VAR_INIT(0);
+atomic_bool conntrack_log_enabled_flag = ATOMIC_VAR_INIT(false);
 atomic_bool conntrack_log_all_zones = ATOMIC_VAR_INIT(true);
 atomic_uint32_t conntrack_log_zones[CT_LOG_ZONE_WORDS];
 
-static atomic_uint ct_log_rate = ATOMIC_VAR_INIT(1000);  /* Events/sec. */
-static struct ovsthread_once ct_log_once = OVSTHREAD_ONCE_INITIALIZER;
+static atomic_uint ct_log_rate = ATOMIC_VAR_INIT(1000);  /* Lines/sec. */
 
-/* Registry of rings.  Rings are never freed: a ring whose thread has exited
- * is drained and then reused by the next thread that needs one. */
-static struct ovs_mutex ct_log_mutex = OVS_MUTEX_INITIALIZER;
-static struct ct_log_ring *ct_log_rings[CT_LOG_MAX_RINGS];
-static atomic_uint ct_log_n_rings;
-static ovsthread_key_t ct_log_key;
+/* A plain per-second token bucket, shared by however many threads call
+ * conntrack_log_conn() -- in practice, the 'ct_clean' sweep thread almost
+ * always, and occasionally whatever thread handles an explicit flush.
+ * Neither is a PMD, both are rare and slow-moving next to a packet rate, so
+ * there is no dedicated lock here: a window reset racing with a budget
+ * decrement can let through or hold back at most one extra line right at a
+ * second boundary, which is not worth a mutex to avoid. */
+static atomic_llong ct_log_window_start = ATOMIC_VAR_INIT(0);
+static atomic_int ct_log_budget = ATOMIC_VAR_INIT(0);
 
-static void *ct_log_thread_main(void *);
 static void ct_log_unixctl_set(struct unixctl_conn *, int, const char *[],
                                void *);
 static void ct_log_unixctl_show(struct unixctl_conn *, int, const char *[],
@@ -101,7 +64,7 @@ conntrack_log_init(void)
 
     if (ovsthread_once_start(&once)) {
         unixctl_command_register("conntrack/log-set",
-                                 "[events=new,destroy|all|none] [zones=all|LIST] "
+                                 "[enable|disable] [zones=all|LIST] "
                                  "[rate=N]", 0, 3, ct_log_unixctl_set, NULL);
         unixctl_command_register("conntrack/log-show", "", 0, 0,
                                  ct_log_unixctl_show, NULL);
@@ -109,98 +72,31 @@ conntrack_log_init(void)
     }
 }
 
-static void
-ct_log_ring_release(void *ring_)
-{
-    struct ct_log_ring *ring = ring_;
-
-    atomic_store_explicit(&ring->in_use, false, memory_order_release);
-}
-
-/* Returns the calling thread's ring, claiming a free one or allocating a new
- * one the first time.  Returns NULL if all CT_LOG_MAX_RINGS are in use. */
-static struct ct_log_ring *
-ct_log_thread_ring(void)
-{
-    struct ct_log_ring *ring = ovsthread_getspecific(ct_log_key);
-    unsigned int n;
-
-    if (OVS_LIKELY(ring)) {
-        return ring;
-    }
-
-    ovs_mutex_lock(&ct_log_mutex);
-    atomic_read_relaxed(&ct_log_n_rings, &n);
-    for (unsigned int i = 0; i < n && !ring; i++) {
-        bool expected = false;
-
-        if (atomic_compare_exchange_strong_explicit(
-                &ct_log_rings[i]->in_use, &expected, true,
-                memory_order_acquire, memory_order_relaxed)) {
-            ring = ct_log_rings[i];
-        }
-    }
-    if (!ring && n < CT_LOG_MAX_RINGS) {
-        ring = xmalloc_cacheline(sizeof *ring);
-        atomic_init(&ring->tail, 0);
-        atomic_init(&ring->head, 0);
-        atomic_init(&ring->in_use, true);
-        ct_log_rings[n] = ring;
-        atomic_store_explicit(&ct_log_n_rings, n + 1, memory_order_release);
-    }
-    ovs_mutex_unlock(&ct_log_mutex);
-
-    if (ring) {
-        ovsthread_setspecific(ct_log_key, ring);
-    }
-    return ring;
-}
-
+/* Returns true if a line may be written right now, having spent one unit of
+ * the per-second budget; false if the caller must skip it (and count it as
+ * rate-limited).  Only ever gates whether a line is WRITTEN -- callers must
+ * not let it gate whether the connection is removed. */
 static bool
-ct_log_ring_push(struct ct_log_ring *ring, const struct ct_log_event *ev)
+ct_log_take_budget(long long now)
 {
-    uint32_t tail, head;
+    unsigned int rate;
+    long long window_start;
+    int budget_before;
 
-    atomic_read_relaxed(&ring->tail, &tail);
-    atomic_read_explicit(&ring->head, &head, memory_order_acquire);
-    if (tail - head >= CT_LOG_RING_SIZE) {
-        return false;                           /* Full. */
+    atomic_read_relaxed(&ct_log_rate, &rate);
+    if (!rate) {
+        return true;                             /* Unlimited. */
     }
 
-    ring->slots[tail & CT_LOG_RING_MASK] = *ev;
-    atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
-    return true;
-}
-
-void
-conntrack_log_conn(enum ct_log_event_type type, enum ct_log_reason reason,
-                   struct conn *conn)
-{
-    struct ct_log_ring *ring = ct_log_thread_ring();
-    struct ct_log_event ev;
-
-    if (OVS_UNLIKELY(!ring)) {
-        COVERAGE_INC(conntrack_log_dropped);
-        return;
+    atomic_read_relaxed(&ct_log_window_start, &window_start);
+    if (now - window_start >= 1000) {
+        atomic_store_relaxed(&ct_log_window_start, now);
+        atomic_store_relaxed(&ct_log_budget, (int) rate);
     }
 
-    /* Timestamps are taken here, on the producer side, so that they are
-     * not skewed by the delay before the 'ct_log' thread gets to the event. */
-    ev.ts_msec = time_wall_msec();
-    ev.age_msec = type == CT_LOG_DESTROY ? time_msec() - conn->created : 0;
-    ev.orig = conn->key_node[CT_DIR_FWD].key;
-    ev.reply = conn->key_node[CT_DIR_REV].key;
-    ev.nat_action = conn->nat_action;
-    ev.type = type;
-    ev.reason = reason;
-
-    ovs_mutex_lock(&conn->lock);
-    ev.mark = conn->mark;
-    ovs_mutex_unlock(&conn->lock);
-
-    if (!ct_log_ring_push(ring, &ev)) {
-        COVERAGE_INC(conntrack_log_dropped);
-    }
+    atomic_sub_explicit(&ct_log_budget, 1, &budget_before,
+                        memory_order_relaxed);
+    return budget_before > 0;
 }
 
 static void
@@ -243,200 +139,83 @@ ct_log_reason_name(enum ct_log_reason reason)
         return "expired";
     case CT_LOG_R_FLUSHED:
         return "flushed";
-    case CT_LOG_R_NONE:
     case CT_LOG_R_SHUTDOWN:
     default:
         return "unknown";
     }
 }
 
-static void
-ct_log_format_event(struct ds *ds, const struct ct_log_event *ev)
+/* Logs 'conn's whole lifecycle -- creation and purge -- in one line.  See
+ * the comment on conntrack_log_conn() in conntrack-log.h: this runs inline,
+ * on whichever thread is already removing 'conn', with no ring and no
+ * separate consumer thread. */
+void
+conntrack_log_conn(enum ct_log_reason reason, struct conn *conn)
 {
-    ds_put_format(ds, "%s ts=%lld", ev->type == CT_LOG_NEW ? "NEW" : "DESTROY",
-                  ev->ts_msec);
+    const struct conn_key *orig = &conn->key_node[CT_DIR_FWD].key;
+    const struct conn_key *reply = &conn->key_node[CT_DIR_REV].key;
+    long long purged_wall, age_ms, created_wall;
+    uint32_t mark;
+    struct ds ds;
 
-    switch (ev->orig.nw_proto) {
+    if (!ct_log_take_budget(time_msec())) {
+        COVERAGE_INC(conntrack_log_ratelimited);
+        return;
+    }
+
+    /* 'created' is in time_msec() (monotonic) units, immune to wall-clock
+     * adjustments; reconstruct a wall-clock creation time from the current
+     * wall time and that monotonic age, the same way a human-readable
+     * 'created' timestamp would be computed anywhere else in this file. */
+    age_ms = time_msec() - conn->created;
+    purged_wall = time_wall_msec();
+    created_wall = purged_wall - age_ms;
+
+    ovs_mutex_lock(&conn->lock);
+    mark = conn->mark;
+    ovs_mutex_unlock(&conn->lock);
+
+    ds_init(&ds);
+    ds_put_cstr(&ds, "CT");
+
+    switch (orig->nw_proto) {
     case IPPROTO_TCP:
-        ds_put_cstr(ds, " proto=tcp");
+        ds_put_cstr(&ds, " proto=tcp");
         break;
     case IPPROTO_UDP:
-        ds_put_cstr(ds, " proto=udp");
+        ds_put_cstr(&ds, " proto=udp");
         break;
     case IPPROTO_ICMP:
-        ds_put_cstr(ds, " proto=icmp");
+        ds_put_cstr(&ds, " proto=icmp");
         break;
     case IPPROTO_ICMPV6:
-        ds_put_cstr(ds, " proto=icmpv6");
+        ds_put_cstr(&ds, " proto=icmpv6");
         break;
     default:
-        ds_put_format(ds, " proto=%"PRIu8, ev->orig.nw_proto);
+        ds_put_format(&ds, " proto=%"PRIu8, orig->nw_proto);
     }
-    ds_put_format(ds, " zone=%"PRIu16, ev->orig.zone);
-    ct_log_format_tuple(ds, "orig", &ev->orig);
-    ct_log_format_tuple(ds, "reply", &ev->reply);
+    ds_put_format(&ds, " zone=%"PRIu16, orig->zone);
+    ct_log_format_tuple(&ds, "orig", orig);
+    ct_log_format_tuple(&ds, "reply", reply);
 
-    if (ev->nat_action) {
-        ds_put_format(ds, " nat=%s%s%s",
-                      ev->nat_action & NAT_ACTION_SNAT_ALL ? "snat" : "",
-                      (ev->nat_action & NAT_ACTION_SNAT_ALL)
-                      && (ev->nat_action & NAT_ACTION_DNAT_ALL) ? "," : "",
-                      ev->nat_action & NAT_ACTION_DNAT_ALL ? "dnat" : "");
+    if (conn->nat_action) {
+        ds_put_format(&ds, " nat=%s%s%s",
+                      conn->nat_action & NAT_ACTION_SNAT_ALL ? "snat" : "",
+                      (conn->nat_action & NAT_ACTION_SNAT_ALL)
+                      && (conn->nat_action & NAT_ACTION_DNAT_ALL) ? "," : "",
+                      conn->nat_action & NAT_ACTION_DNAT_ALL ? "dnat" : "");
     }
-    if (ev->mark) {
-        ds_put_format(ds, " mark=%#"PRIx32, ev->mark);
+    if (mark) {
+        ds_put_format(&ds, " mark=%#"PRIx32, mark);
     }
-    if (ev->type == CT_LOG_DESTROY) {
-        ds_put_format(ds, " created=%lld age=%lldms reason=%s",
-                      ev->ts_msec - ev->age_msec, ev->age_msec,
-                      ct_log_reason_name(ev->reason));
-    }
+    ds_put_format(&ds, " created=%lld purged=%lld age=%lldms reason=%s",
+                  created_wall, purged_wall, age_ms,
+                  ct_log_reason_name(reason));
+
+    VLOG_INFO("%s", ds_cstr(&ds));
+    ds_destroy(&ds);
 }
 
-static int
-ct_log_event_compare(const void *a_, const void *b_)
-{
-    const struct ct_log_event *a = a_, *b = b_;
-
-    if (a->ts_msec != b->ts_msec) {
-        return a->ts_msec < b->ts_msec ? -1 : 1;
-    }
-    return (int) a->type - (int) b->type;     /* NEW before DESTROY. */
-}
-
-/* Moves all the events currently in the rings to '*pending'. */
-static void
-ct_log_collect(struct ct_log_event **pending, size_t *n, size_t *allocated)
-{
-    unsigned int n_rings;
-
-    atomic_read_explicit(&ct_log_n_rings, &n_rings, memory_order_acquire);
-    for (unsigned int i = 0; i < n_rings; i++) {
-        struct ct_log_ring *ring = ct_log_rings[i];
-        uint32_t head, tail;
-
-        atomic_read_relaxed(&ring->head, &head);
-        atomic_read_explicit(&ring->tail, &tail, memory_order_acquire);
-        if (head == tail) {
-            continue;
-        }
-        if (*n + (tail - head) > *allocated) {
-            *allocated = MAX(*allocated * 2, *n + (tail - head));
-            *pending = xrealloc(*pending, *allocated * sizeof **pending);
-        }
-        for (; head != tail; head++) {
-            (*pending)[(*n)++] = ring->slots[head & CT_LOG_RING_MASK];
-        }
-        atomic_store_explicit(&ring->head, head, memory_order_release);
-    }
-}
-
-/* Collects the events of all the rings, sorts them by timestamp, then formats
- * and logs the ones old enough to be safely ordered, at most 'rate' per second
- * (0 means unlimited); events over the budget are dropped and counted. */
-static void *
-ct_log_thread_main(void *aux OVS_UNUSED)
-{
-    struct ct_log_event *pending = NULL;
-    size_t n_pending = 0, allocated = 0;
-    long long window_start = 0;
-    unsigned int budget = 0;
-    struct ds ds = DS_EMPTY_INITIALIZER;
-
-    for (;;) {
-        long long now = time_msec();
-        unsigned int rate;
-        size_t done = 0;
-
-        atomic_read_relaxed(&ct_log_rate, &rate);
-        if (now - window_start >= 1000) {
-            window_start = now;
-            budget = rate;
-        }
-
-        ct_log_collect(&pending, &n_pending, &allocated);
-        qsort(pending, n_pending, sizeof *pending, ct_log_event_compare);
-
-        long long watermark = time_wall_msec() - CT_LOG_HOLD_MS;
-        for (; done < n_pending && pending[done].ts_msec <= watermark;
-             done++) {
-            if (rate && !budget) {
-                COVERAGE_INC(conntrack_log_ratelimited);
-                continue;
-            }
-            budget -= rate ? 1 : 0;
-
-            ds_clear(&ds);
-            ct_log_format_event(&ds, &pending[done]);
-            VLOG_INFO("%s", ds_cstr(&ds));
-        }
-        n_pending -= done;
-        memmove(pending, pending + done, n_pending * sizeof *pending);
-
-        poll_timer_wait(CT_LOG_DRAIN_INTERVAL_MS);
-        poll_block();
-    }
-
-    OVS_NOT_REACHED();
-}
-
-/* Enables the drain thread on first use. */
-static void
-ct_log_start(void)
-{
-    if (ovsthread_once_start(&ct_log_once)) {
-        ovsthread_key_create(&ct_log_key, ct_log_ring_release);
-        ovs_thread_create("ct_log", ct_log_thread_main, NULL);
-        ovsthread_once_done(&ct_log_once);
-    }
-}
-
-static unsigned int
-ct_log_get_rate(void)
-{
-    unsigned int rate;
-
-    atomic_read_relaxed(&ct_log_rate, &rate);
-    return rate;
-}
-
-void
-conntrack_log_set(unsigned int mask, unsigned int rate)
-{
-    atomic_store_relaxed(&ct_log_rate, rate);
-    if (mask) {
-        ct_log_start();
-    }
-    /* Release: pairs with the acquire in conntrack_log_enabled(), so a
-     * producer that sees the mask also sees the thread key. */
-    atomic_store_explicit(&conntrack_log_mask, mask, memory_order_release);
-}
-
-static bool
-ct_log_parse_events(const char *s, unsigned int *mask)
-{
-    char *copy = xstrdup(s), *save = NULL, *tok;
-    bool ok = true;
-
-    *mask = 0;
-    for (tok = strtok_r(copy, ",", &save); tok;
-         tok = strtok_r(NULL, ",", &save)) {
-        if (!strcmp(tok, "new")) {
-            *mask |= CT_LOG_NEW;
-        } else if (!strcmp(tok, "destroy")) {
-            *mask |= CT_LOG_DESTROY;
-        } else if (!strcmp(tok, "all")) {
-            *mask |= CT_LOG_ALL_EVENTS;
-        } else if (strcmp(tok, "none")) {
-            ok = false;
-        }
-    }
-    free(copy);
-    return ok;
-}
-
-/* Parses a zone list such as "all" or "1,5,10-20" into 'words'.  Returns
- * false if 'spec' is invalid; '*all' is set if it was "all". */
 static bool
 ct_log_parse_zones(const char *spec, uint32_t words[CT_LOG_ZONE_WORDS],
                    bool *all)
@@ -472,7 +251,7 @@ static void
 ct_log_set_zones(const uint32_t words[CT_LOG_ZONE_WORDS], bool all)
 {
     /* Write the bitmap before dropping "all", and raise "all" first, so that
-     * a concurrent producer never sees a filter that is neither the old nor
+     * a concurrent reader never sees a filter that is neither the old nor
      * the new one for a zone that is in both. */
     if (all) {
         atomic_store_relaxed(&conntrack_log_all_zones, true);
@@ -522,24 +301,35 @@ ct_log_format_zones(struct ds *ds)
     }
 }
 
+void
+conntrack_log_set(bool enable, unsigned int rate)
+{
+    atomic_store_relaxed(&ct_log_rate, rate);
+    /* Release: pairs with the acquire in conntrack_log_enabled(), so a
+     * reader that sees 'enabled' also sees a consistent zone filter. */
+    atomic_store_explicit(&conntrack_log_enabled_flag, enable,
+                          memory_order_release);
+}
+
 static void
 ct_log_unixctl_set(struct unixctl_conn *conn, int argc, const char *argv[],
                    void *aux OVS_UNUSED)
 {
-    unsigned int new_mask, rate;
-    bool have_mask = false, have_rate = false, have_zones = false;
+    bool new_enabled, have_enabled = false, have_rate = false;
+    bool have_zones = false, all_zones = false;
+    unsigned int rate = 0;
     uint32_t *zone_words = NULL;
-    bool all_zones = false;
 
     for (int i = 1; i < argc; i++) {
-        if (!strncmp(argv[i], "events=", 7)) {
-            if (!ct_log_parse_events(argv[i] + 7, &new_mask)) {
-                unixctl_command_reply_error(conn, "invalid events list");
-                return;
-            }
-            have_mask = true;
+        if (!strcmp(argv[i], "enable")) {
+            new_enabled = true;
+            have_enabled = true;
+        } else if (!strcmp(argv[i], "disable")) {
+            new_enabled = false;
+            have_enabled = true;
         } else if (!strncmp(argv[i], "rate=", 5)) {
             if (!str_to_uint(argv[i] + 5, 10, &rate)) {
+                free(zone_words);
                 unixctl_command_reply_error(conn, "invalid rate");
                 return;
             }
@@ -569,8 +359,14 @@ ct_log_unixctl_set(struct unixctl_conn *conn, int argc, const char *argv[],
     if (have_rate) {
         atomic_store_relaxed(&ct_log_rate, rate);
     }
-    if (have_mask) {
-        conntrack_log_set(new_mask, ct_log_get_rate());
+    if (have_enabled) {
+        bool cur_enabled;
+
+        atomic_read_relaxed(&conntrack_log_enabled_flag, &cur_enabled);
+        if (new_enabled != cur_enabled) {
+            atomic_store_explicit(&conntrack_log_enabled_flag, new_enabled,
+                                  memory_order_release);
+        }
     }
     unixctl_command_reply(conn, NULL);
 }
@@ -580,20 +376,17 @@ ct_log_unixctl_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
                     const char *argv[] OVS_UNUSED, void *aux OVS_UNUSED)
 {
     struct ds ds = DS_EMPTY_INITIALIZER;
-    unsigned int mask, rate;
+    bool enabled;
+    unsigned int rate;
 
-    atomic_read_relaxed(&conntrack_log_mask, &mask);
+    atomic_read_relaxed(&conntrack_log_enabled_flag, &enabled);
     atomic_read_relaxed(&ct_log_rate, &rate);
 
-    ds_put_format(&ds, "events: %s%s%s%s\n",
-                  mask & CT_LOG_NEW ? "new" : "",
-                  mask == CT_LOG_ALL_EVENTS ? " " : "",
-                  mask & CT_LOG_DESTROY ? "destroy" : "",
-                  mask ? "" : "none");
+    ds_put_format(&ds, "logging: %s\n", enabled ? "enabled" : "disabled");
     ds_put_cstr(&ds, "zones: ");
     ct_log_format_zones(&ds);
     ds_put_char(&ds, '\n');
-    ds_put_format(&ds, "rate limit: %u events/sec%s\n", rate,
+    ds_put_format(&ds, "rate limit: %u lines/sec%s\n", rate,
                   rate ? "" : " (unlimited)");
     unixctl_command_reply(conn, ds_cstr(&ds));
     ds_destroy(&ds);

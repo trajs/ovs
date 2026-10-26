@@ -25,23 +25,19 @@
 
 /* Connection tracking event logging.
  *
- * Datapath threads (PMDs, the 'ct_clean' thread, appctl) only copy a small
- * fixed-size record into a lock-free bounded ring.  A dedicated 'ct_log'
- * thread drains the ring, formats the records and writes them through vlog
- * (module 'conntrack_log').  Producers never block, format text, allocate
- * memory or take locks: if the ring is full the event is dropped and counted.
+ * A connection's whole lifecycle is reported in a single line, written when
+ * the connection is purged: by the existing 'ct_clean' sweep thread for a
+ * normal expiry, or by whichever thread handles an explicit flush.  Neither
+ * of those is ever a PMD thread, so the formatting and the vlog write happen
+ * inline, right there -- no dedicated thread, no ring buffer, no additional
+ * memory.  The only state this adds is the 'created' timestamp already
+ * carried on struct conn.
  *
- * When logging is disabled, the cost on the datapath is one relaxed atomic
- * load (see conntrack_log_enabled()). */
-
-enum ct_log_event_type {
-    CT_LOG_NEW = 1 << 0,
-    CT_LOG_DESTROY = 1 << 1,
-};
-#define CT_LOG_ALL_EVENTS (CT_LOG_NEW | CT_LOG_DESTROY)
+ * When logging is disabled, the cost on the datapath is one atomic load
+ * (see conntrack_log_enabled()), and nothing is logged until a connection
+ * that is already being torn down reaches conn_clean(). */
 
 enum ct_log_reason {
-    CT_LOG_R_NONE,        /* Not applicable (NEW events). */
     CT_LOG_R_EXPIRED,     /* Timed out, or replaced by a new connection. */
     CT_LOG_R_FLUSHED,     /* Removed by an explicit flush. */
     CT_LOG_R_SHUTDOWN,    /* Connection tracker destroyed; never logged. */
@@ -49,28 +45,27 @@ enum ct_log_reason {
 
 #define CT_LOG_ZONE_WORDS ((UINT16_MAX + 1) / 32)
 
-extern atomic_uint conntrack_log_mask;
+extern atomic_bool conntrack_log_enabled_flag;
 extern atomic_bool conntrack_log_all_zones;
 extern atomic_uint32_t conntrack_log_zones[CT_LOG_ZONE_WORDS];
 
 void conntrack_log_init(void);
 
-/* Sets the logged events ('mask' of enum ct_log_event_type; 0 disables) and
- * the maximum rate in events per second (0 for unlimited). */
-void conntrack_log_set(unsigned int mask, unsigned int rate);
+/* Turns logging on or off, and sets the maximum rate in lines per second
+ * (0 for unlimited). */
+void conntrack_log_set(bool enable, unsigned int rate);
 
-/* Returns true if any of the events in 'type' is currently being logged for
- * connections in conntrack zone 'zone'.  The zone filter is only looked at
- * once logging is enabled, so the cost when it is disabled is one atomic
- * load. */
+/* Returns true if logging is enabled for connections in conntrack zone
+ * 'zone'.  The zone filter is only looked at once logging is enabled, so the
+ * cost when it is disabled is one atomic load. */
 static inline bool
-conntrack_log_enabled(enum ct_log_event_type type, uint16_t zone)
+conntrack_log_enabled(uint16_t zone)
 {
-    unsigned int mask;
-    bool all_zones;
+    bool enabled, all_zones;
 
-    atomic_read_explicit(&conntrack_log_mask, &mask, memory_order_acquire);
-    if (OVS_LIKELY(!(mask & type))) {
+    atomic_read_explicit(&conntrack_log_enabled_flag, &enabled,
+                          memory_order_acquire);
+    if (OVS_LIKELY(!enabled)) {
         return false;
     }
 
@@ -85,10 +80,13 @@ conntrack_log_enabled(enum ct_log_event_type type, uint16_t zone)
     }
 }
 
-/* Queues an event for 'conn'.  Callers must check conntrack_log_enabled()
- * first, so that the (small) cost of snapshotting the connection is only paid
- * when logging is on.  Safe to call from any thread. */
-void conntrack_log_conn(enum ct_log_event_type, enum ct_log_reason,
-                        struct conn *);
+/* Logs 'conn's lifecycle in one line: its tuple, how long it lived, and why
+ * it was purged.  Called inline by whichever thread is already removing
+ * 'conn' -- never a PMD.  Callers must check conntrack_log_enabled() first,
+ * so the (small) cost of reading the connection is only paid when logging is
+ * on; removal of 'conn' itself must already be unconditional and must never
+ * be made to wait on this call, which may itself skip writing a line (and
+ * count it as rate-limited) without affecting that removal at all. */
+void conntrack_log_conn(enum ct_log_reason, struct conn *);
 
 #endif /* conntrack-log.h */

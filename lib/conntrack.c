@@ -591,10 +591,15 @@ conn_clean(struct conntrack *ct, struct conn *conn,
         return;
     }
 
+    /* Logging (if enabled) happens inline, here, on whichever thread is
+     * already doing the removal below -- the 'ct_clean' sweep thread for a
+     * normal expiry, or whatever thread issued an explicit flush. Neither
+     * is ever a PMD. Removal itself is unconditional and must not be made
+     * to wait on it; a skipped line (because the output rate is capped)
+     * never affects whether the connection is reclaimed. */
     if (reason != CT_LOG_R_SHUTDOWN
-        && conntrack_log_enabled(CT_LOG_DESTROY,
-                                    conn->key_node[CT_DIR_FWD].key.zone)) {
-        conntrack_log_conn(CT_LOG_DESTROY, reason, conn);
+        && conntrack_log_enabled(conn->key_node[CT_DIR_FWD].key.zone)) {
+        conntrack_log_conn(reason, conn);
     }
 
     ovs_mutex_lock(&ct->ct_lock);
@@ -1450,22 +1455,12 @@ process_one(struct conntrack *ct, struct dp_packet *pkt,
         }
         ovs_rwlock_unlock(&ct->resources_lock);
 
-        struct conn *nc = NULL;
-
         ovs_mutex_lock(&ct->ct_lock);
         if (!conn_lookup(ct, &ctx->key, now, NULL, NULL)) {
-            nc = conn_not_found(ct, pkt, ctx, commit, now, nat_action_info,
-                                helper, alg_exp, ct_alg_ctl, tp_id);
-            conn = nc;
+            conn = conn_not_found(ct, pkt, ctx, commit, now, nat_action_info,
+                                  helper, alg_exp, ct_alg_ctl, tp_id);
         }
         ovs_mutex_unlock(&ct->ct_lock);
-
-        /* Logged outside of 'ct_lock' to keep the critical section short.
-         * The connection cannot be freed under us: reclamation is deferred
-         * with ovsrcu_postpone() and this thread is not quiescent. */
-        if (nc && conntrack_log_enabled(CT_LOG_NEW, ctx->key.zone)) {
-            conntrack_log_conn(CT_LOG_NEW, CT_LOG_R_NONE, nc);
-        }
     }
 
     write_ct_md(pkt, zone, conn, &ctx->key, alg_exp);

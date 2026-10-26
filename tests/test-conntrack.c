@@ -311,14 +311,16 @@ new_conns_thread_main(void *aux_)
 
 /* Benchmark of new connection creation and destruction.  Each of 'n_threads'
  * threads commits 'n_conns' distinct UDP connections, 'NETDEV_MAX_BURST' per
- * call.  Then all the connections are flushed.  'mode' selects which
- * connection tracking log events are enabled: "off", "new" or "both". */
+ * call.  Then all the connections are flushed.  'mode' is "off" or "on" and
+ * selects whether connection tracking logging is enabled; when it is, every
+ * connection logs exactly one combined creation-and-purge line, written
+ * inline by the thread that flushes it. */
 static void
 test_benchmark_new_conns(struct ovs_cmdl_context *ctx)
 {
     struct thread_aux *threads;
     long long start, create_us, flush_us;
-    unsigned mask = 0;
+    bool enabled;
     unsigned i;
 
     fatal_signal_init();
@@ -329,22 +331,24 @@ test_benchmark_new_conns(struct ovs_cmdl_context *ctx)
         ovs_fatal(0, "n_threads >= 1 and 1 <= n_conns <= 60000");
     }
     batch_size = NETDEV_MAX_BURST;
-    if (!strcmp(ctx->argv[3], "new")) {
-        mask = CT_LOG_NEW;
-    } else if (!strcmp(ctx->argv[3], "both")) {
-        mask = CT_LOG_NEW | CT_LOG_DESTROY;
-    } else if (strcmp(ctx->argv[3], "off")) {
-        ovs_fatal(0, "mode must be off, new or both");
+    if (!strcmp(ctx->argv[3], "on")) {
+        enabled = true;
+    } else if (!strcmp(ctx->argv[3], "off")) {
+        enabled = false;
+    } else {
+        ovs_fatal(0, "mode must be off or on");
     }
 
-    /* Keep the log thread's output out of the terminal. */
+    unsigned int rate = ctx->argc > 5 ? strtoul(ctx->argv[5], NULL, 0) : 0;
+
+    /* Keep the log output out of the terminal. */
     vlog_set_levels(NULL, VLF_CONSOLE, VLL_OFF);
     vlog_set_log_file(ctx->argc > 4 ? ctx->argv[4] : "/dev/null");
 
     threads = xcalloc(n_threads, sizeof *threads);
     ovs_barrier_init(&barrier, n_threads + 1);
     ct = conntrack_init();
-    conntrack_log_set(mask, 0);
+    conntrack_log_set(enabled, rate);
 
     for (i = 0; i < n_threads; i++) {
         threads[i].tid = i;
@@ -370,10 +374,7 @@ test_benchmark_new_conns(struct ovs_cmdl_context *ctx)
            ctx->argv[3], n_threads, n_pkts, create_us,
            create_us * 1e3 / n_pkts, flush_us);
 
-    if (mask) {
-        xsleep(2);              /* Let the log thread drain the ring. */
-    }
-    conntrack_log_set(0, 0);
+    conntrack_log_set(false, 0);
     conntrack_destroy(ct);
     ovs_barrier_destroy(&barrier);
     free(threads);
@@ -710,7 +711,7 @@ static const struct ovs_cmdl_command commands[] = {
     {"pcap", "file [batch_size]", 1, 2, test_pcap, OVS_RO},
     /* Measures new connection creation (with optional event logging) and
      * flush time. */
-    {"benchmark-new-conns", "n_threads n_conns off|new|both [logfile]", 3, 4,
+    {"benchmark-new-conns", "n_threads n_conns off|on [logfile] [rate]", 3, 5,
         test_benchmark_new_conns, OVS_RO},
     /* Creates 'n_conns' connections in 'n_zones' zones each.
      * Afterwards triggers flush requests repeadeatly for the last filled zone
