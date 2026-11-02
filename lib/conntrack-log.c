@@ -36,11 +36,11 @@ VLOG_DEFINE_THIS_MODULE(conntrack_log);
  * "dropped" counter -- this one covers every skipped line. */
 COVERAGE_DEFINE(conntrack_log_ratelimited);
 
-atomic_bool conntrack_log_enabled_flag = ATOMIC_VAR_INIT(false);
-atomic_bool conntrack_log_all_zones = ATOMIC_VAR_INIT(true);
+atomic_bool conntrack_log_enabled_flag = false;
+atomic_bool conntrack_log_all_zones = true;
 atomic_uint32_t conntrack_log_zones[CT_LOG_ZONE_WORDS];
 
-static atomic_uint ct_log_rate = ATOMIC_VAR_INIT(1000);  /* Lines/sec. */
+static atomic_uint ct_log_rate = 1000;  /* Lines/sec. */
 
 /* A plain per-second token bucket, shared by however many threads call
  * conntrack_log_conn() -- in practice, the 'ct_clean' sweep thread almost
@@ -49,8 +49,8 @@ static atomic_uint ct_log_rate = ATOMIC_VAR_INIT(1000);  /* Lines/sec. */
  * there is no dedicated lock here: a window reset racing with a budget
  * decrement can let through or hold back at most one extra line right at a
  * second boundary, which is not worth a mutex to avoid. */
-static atomic_llong ct_log_window_start = ATOMIC_VAR_INIT(0);
-static atomic_int ct_log_budget = ATOMIC_VAR_INIT(0);
+static atomic_llong ct_log_window_start = 0;
+static atomic_int ct_log_budget = 0;
 
 static void ct_log_unixctl_set(struct unixctl_conn *, int, const char *[],
                                void *);
