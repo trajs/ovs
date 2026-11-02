@@ -492,11 +492,13 @@ static void
 esp_ctl_sa_flush(struct unixctl_conn *conn, int argc OVS_UNUSED,
                  const char *argv[] OVS_UNUSED, void *aux OVS_UNUSED)
 {
+    size_t n = hmap_count(&ike_sas);
     struct ike_sa *ike;
 
     HMAP_FOR_EACH_SAFE (ike, node, &ike_sas) {
         ike_sa_delete(ike);
     }
+    VLOG_INFO("flushed %"PRIuSIZE" SAs", n);
     unixctl_command_reply(conn, NULL);
 }
 
@@ -521,14 +523,20 @@ esp_ctl_format(struct ds *ds, uint32_t if_id)
 {
     struct ike_sa **sas = xmalloc(hmap_count(&ike_sas) * sizeof *sas);
     struct ike_sa *ike;
+    bool has_outbound = false;
     size_t n = 0;
 
     HMAP_FOR_EACH (ike, node, &ike_sas) {
         if (ike->if_id == if_id) {
             sas[n++] = ike;
+            has_outbound = has_outbound || !ike->inbound;
         }
     }
     qsort(sas, n, sizeof *sas, compare_ike_sas);
+
+    if (!has_outbound) {
+        ds_put_cstr(ds, "  no outbound SA\n");
+    }
 
     for (size_t i = 0; i < n; i++) {
         const struct esp_sa_params *p = esp_sa_get_params(sas[i]->sa);
@@ -539,6 +547,47 @@ esp_ctl_format(struct ds *ds, uint32_t if_id)
                       sas[i]->sa, sas[i]->inbound);
     }
     free(sas);
+}
+
+static int
+compare_u32(const void *a_, const void *b_)
+{
+    uint32_t a = *(const uint32_t *) a_;
+    uint32_t b = *(const uint32_t *) b_;
+
+    return a < b ? -1 : a > b;
+}
+
+/* Appends to 'ds' the SAs whose interface ID is not among the 'n_known' in
+ * 'known', which have no tunnel, so their packets cannot flow. */
+void
+esp_ctl_format_unbound(struct ds *ds, const uint32_t known[], size_t n_known)
+{
+    uint32_t *ids = xmalloc(hmap_count(&ike_sas) * sizeof *ids);
+    struct ike_sa *ike;
+    size_t n = 0;
+
+    HMAP_FOR_EACH (ike, node, &ike_sas) {
+        bool found = false;
+
+        for (size_t i = 0; i < n_known; i++) {
+            found = found || known[i] == ike->if_id;
+        }
+        for (size_t i = 0; i < n; i++) {
+            found = found || ids[i] == ike->if_id;
+        }
+        if (!found) {
+            ids[n++] = ike->if_id;
+        }
+    }
+    qsort(ids, n, sizeof *ids, compare_u32);
+
+    for (size_t i = 0; i < n; i++) {
+        ds_put_format(ds, "if_id %"PRIu32": no tunnel with this interface "
+                      "ID\n", ids[i]);
+        esp_ctl_format(ds, ids[i]);
+    }
+    free(ids);
 }
 
 void

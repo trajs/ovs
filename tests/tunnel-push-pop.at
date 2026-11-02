@@ -2088,7 +2088,25 @@ AT_CHECK([ovs-appctl esp/sa-add dir=out spi=0x6000 src=1.1.2.88 dnl
 AT_CHECK([ovs-appctl esp/sa-flush])
 AT_CHECK([ovs-appctl esp/show t1], [0], [dnl
 t1: remote 1.1.2.92, keyed by IKE, if_id 7
+  no outbound SA
 ])
+AT_CHECK([grep -c 'flushed' ovs-vswitchd.log], [0], [1
+])
+
+dnl Packets with no outbound SA are counted.
+n=$(ovs-appctl coverage/read-counter esp_tx_no_sa)
+AT_CHECK([ovs-appctl netdev-dummy/receive p1 'INNER_FLOW'])
+OVS_WAIT_UNTIL([test $(ovs-appctl coverage/read-counter esp_tx_no_sa) -gt $n])
+
+dnl An SA with no tunnel for its interface ID is still listed.
+AT_CHECK([ovs-appctl esp/sa-add dir=out spi=0x7000 src=1.1.2.88 dnl
+            dst=1.1.2.93 if_id=8 key=KEY_OUT])
+AT_CHECK([ovs-appctl esp/show | grep -E '^[[a-z]]|spi'], [0], [dnl
+t1: remote 1.1.2.92, keyed by IKE, if_id 7
+if_id 8: no tunnel with this interface ID
+  outbound: spi 0x00007000, aes128-gcm16, esn off
+])
+AT_CHECK([ovs-appctl esp/sa-del dir=out spi=0x7000 dst=1.1.2.93])
 
 dnl Configuration errors.
 AT_CHECK([ovs-vsctl set Interface t1 options:esp_in_key=KEY_IN], [0], [],

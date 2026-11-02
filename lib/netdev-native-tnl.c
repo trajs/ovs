@@ -58,6 +58,7 @@ COVERAGE_DEFINE(native_tnl_l4csum_checked);
 COVERAGE_DEFINE(native_tnl_l4csum_err);
 COVERAGE_DEFINE(native_tnl_esp_natt_keepalive);
 COVERAGE_DEFINE(native_tnl_esp_natt_non_esp);
+COVERAGE_DEFINE(esp_tx_no_sa);
 
 #define VXLAN_HLEN   (sizeof(struct udp_header) +         \
                       sizeof(struct vxlanhdr))
@@ -1220,6 +1221,7 @@ netdev_esp_push_header(const struct netdev *netdev,
 
     sa = esp_sad_lookup(get_16aligned_be32(&esp->spi), &dst);
     if (OVS_UNLIKELY(!sa)) {
+        COVERAGE_INC(esp_tx_no_sa);
         return ENOENT;
     }
 

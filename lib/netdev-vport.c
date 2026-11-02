@@ -985,22 +985,29 @@ netdev_vport_esp_show(struct unixctl_conn *conn, int argc,
     struct ds ds = DS_EMPTY_INITIALIZER;
     struct netdev **vports;
     size_t n_vports;
+    uint32_t *if_ids;
+    size_t n_if_ids = 0;
     bool found = false;
 
     vports = netdev_get_vports(&n_vports);
+    if_ids = xmalloc(n_vports * sizeof *if_ids);
     qsort(vports, n_vports, sizeof *vports, compare_netdev_names);
     for (size_t i = 0; i < n_vports; i++) {
         struct netdev_vport *dev = netdev_vport_cast(vports[i]);
         const char *name = netdev_get_name(vports[i]);
 
-        if (strcmp(netdev_get_type(vports[i]), "esp")
-            || (argc > 1 && strcmp(argv[1], name))) {
+        if (strcmp(netdev_get_type(vports[i]), "esp")) {
             continue;
         }
 
         ovs_mutex_lock(&dev->mutex);
         const struct netdev_tunnel_config *tnl_cfg = vport_tunnel_config(dev);
         if (tnl_cfg->esp_ike) {
+            if_ids[n_if_ids++] = tnl_cfg->esp_if_id;
+        }
+        if (argc > 1 && strcmp(argv[1], name)) {
+            /* Not the one asked for. */
+        } else if (tnl_cfg->esp_ike) {
             ds_put_format(&ds, "%s: remote ", name);
             ipv6_format_mapped(&tnl_cfg->ipv6_dst, &ds);
             ds_put_format(&ds, ", keyed by IKE, if_id %"PRIu32"\n",
@@ -1021,6 +1028,11 @@ netdev_vport_esp_show(struct unixctl_conn *conn, int argc,
         netdev_close(vports[i]);
     }
     free(vports);
+
+    if (argc == 1) {
+        esp_ctl_format_unbound(&ds, if_ids, n_if_ids);
+    }
+    free(if_ids);
 
     if (argc > 1 && !found) {
         unixctl_command_reply_error(conn, "no such esp tunnel");
