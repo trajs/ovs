@@ -6,6 +6,18 @@ Post-v4.0.0
    - ovs-vswitchd:
      * Mirror filters now accept masked fields, e.g. "ip,nw_src=10.0.0.0/24"
        in the "filter" column of the Mirror table.
+   - Userspace datapath:
+     * Added optional logging of connection tracking lifecycles.  Each
+       connection logs exactly one line, written when it is purged, with
+       its tuple, when it was created and purged, and why.  The line is
+       written inline by whichever thread already removes the connection
+       (the sweep thread, or whatever thread handles an explicit flush) --
+       never a PMD thread, and no dedicated thread or ring buffer is added
+       to do it.  Enable with 'ovs-appctl conntrack/log-set enable
+       [zones=LIST] [rate=N]'.  Logging can be limited to some conntrack
+       zones, and output is capped at 'rate' lines per second (default
+       1000) so that a connection storm cannot flood the log; connections
+       are still reclaimed at full speed regardless of the cap.
 
 
 v4.0.0 - 17 Aug 2026
