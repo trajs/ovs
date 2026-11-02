@@ -85,6 +85,9 @@ the number of packets and bytes sent or received through each.  For
 inbound security associations, it also shows the number of packets
 dropped as replays, because they failed authentication, or because
 they were malformed.  The byte counts are of the inner packets.
+For \fBesp_keying=ike\fR tunnels, it also says if a tunnel has no outbound
+security association.  Without \fIport\fR, it also lists security
+associations whose interface ID no tunnel has.
 .
 .IP "\fBesp/spi-alloc\fR"
 .IQ "\fBesp/sa-add dir=\fR{\fBin\fR|\fBout\fR} \fBspi=\fIspi\fR \fBsrc=\fIip\fR \fBdst=\fIip\fR \fBif_id=\fIid\fR \fBkey=\fIkey\fR [\fBesn=yes\fR] [\fBreplay=\fIn\fR] [\fBencap=yes\fR]"

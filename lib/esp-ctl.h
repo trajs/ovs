@@ -21,11 +21,14 @@
  * "kernel-ovs" plugin, to install the security associations of 'esp'
  * tunnels with "esp_keying=ike" through unixctl commands. */
 
+#include <stddef.h>
 #include <stdint.h>
 
 struct ds;
 
 void esp_ctl_init(void);
 void esp_ctl_format(struct ds *, uint32_t if_id);
+void esp_ctl_format_unbound(struct ds *, const uint32_t known[],
+                            size_t n_known);
 
 #endif /* esp-ctl.h */
