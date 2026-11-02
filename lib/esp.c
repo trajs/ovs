@@ -54,41 +54,74 @@ COVERAGE_DEFINE(esp_rx_replay);
 COVERAGE_DEFINE(esp_rx_auth_failed);
 #endif
 
-struct esp_sa {
-    struct cmap_node node;          /* In 'esp_sad', for inbound SAs. */
-    struct esp_sa_params params;
-    uint64_t id;                    /* Unique, never 0. */
 #if defined(HAVE_IPSEC_MB)
-    struct gcm_key_data *gcm_key;   /* Expanded key, cache line aligned. */
+#define ESP_SA_CRYPTO struct gcm_key_data *gcm_key; /* Expanded key, cache line
+                                                     * aligned. */
 #elif defined(HAVE_OPENSSL)
-    const EVP_CIPHER *cipher;
+#define ESP_SA_CRYPTO const EVP_CIPHER *cipher;
+#else
+#define ESP_SA_CRYPTO
 #endif
 
-    /* Outbound.  The explicit IV of a packet is its sequence number XORed
-     * with 'iv_salt', which is random per SA and comes from the system's
-     * entropy source, so that a manually keyed SA that restarts its sequence
-     * numbers does not reuse IVs. */
-    atomic_uint64_t seq;            /* Last sequence number sent. */
-    uint64_t iv_salt;
+/* Packet and byte counts are per thread, each on its own cache line, because
+ * several PMD threads can use an outbound SA at once and sharing these counts
+ * limits how well that scales.  Threads that hash to the same counters still
+ * count correctly, since the counters are atomic. */
+#define ESP_SA_N_COUNTERS 16
+BUILD_ASSERT_DECL(IS_POW2(ESP_SA_N_COUNTERS));
 
-    /* Statistics, of sent packets for an outbound SA and of received ones
-     * for an inbound SA.  'n_bytes' counts the bytes of the payload, that is
-     * of the inner packets. */
-    atomic_uint64_t n_packets;
-    atomic_uint64_t n_bytes;
-    atomic_uint64_t n_replayed;     /* Inbound: dropped as replays. */
-    atomic_uint64_t n_auth_failed;  /* Inbound: failed authentication. */
-    atomic_uint64_t n_malformed;    /* Inbound: bad padding or length. */
-    atomic_uint64_t n_tx_errors;    /* Outbound: sequence exhausted or
-                                     * encryption failed. */
+struct esp_sa_counters {
+    PADDED_MEMBERS(CACHE_LINE_SIZE,
+        atomic_uint64_t n_packets;
+        atomic_uint64_t n_bytes;
+    );
+};
+
+/* The sequence number is written for every outbound packet, so it is kept away
+ * from what every packet only reads.  The anti-replay state is separate as
+ * well: all the packets of an inbound SA normally arrive on one queue, so it
+ * is rarely contended. */
+struct esp_sa {
+    PADDED_MEMBERS(CACHE_LINE_SIZE,
+        /* Read-mostly. */
+        struct cmap_node node;          /* In 'esp_sad'. */
+        struct esp_sa_params params;
+        uint64_t id;                    /* Unique, never 0. */
+        ESP_SA_CRYPTO
+
+        /* The explicit IV of an outbound packet is its sequence number XORed
+         * with 'iv_salt', which is random per SA and comes from the system's
+         * entropy source, so that a manually keyed SA that restarts its
+         * sequence numbers does not reuse IVs. */
+        uint64_t iv_salt;
+
+        uint32_t replay_size;           /* In packets, multiple of 64. */
+    );
+
+    PADDED_MEMBERS(CACHE_LINE_SIZE,
+        atomic_uint64_t seq;            /* Outbound: last sequence number
+                                         * sent. */
+
+        /* Errors.  Other statistics are in 'counters'. */
+        atomic_uint64_t n_replayed;     /* Inbound: dropped as replays. */
+        atomic_uint64_t n_auth_failed;  /* Inbound: failed authentication. */
+        atomic_uint64_t n_malformed;    /* Inbound: bad padding or length. */
+        atomic_uint64_t n_tx_errors;    /* Outbound: sequence exhausted or
+                                         * encryption failed. */
+    );
+
+    /* Packets sent by an outbound SA or received by an inbound SA.  'n_bytes'
+     * counts the bytes of the payload, that is of the inner packets. */
+    struct esp_sa_counters counters[ESP_SA_N_COUNTERS];
 
     /* Inbound anti-replay window (RFC 4303 section 3.4.3 and appendix A).
      * Bit (N % replay_size) of 'replay_bitmap' is set if sequence number N
      * has been received, for N in (replay_top - replay_size, replay_top]. */
-    struct ovs_mutex replay_mutex;
-    uint64_t replay_top OVS_GUARDED;
-    uint32_t replay_size;           /* In packets, multiple of 64. */
-    uint64_t *replay_bitmap;        /* Its contents are guarded. */
+    PADDED_MEMBERS(CACHE_LINE_SIZE,
+        struct ovs_mutex replay_mutex;
+        uint64_t replay_top OVS_GUARDED;
+        uint64_t *replay_bitmap;        /* Its contents are guarded. */
+    );
 };
 
 #ifdef ESP_CRYPTO
@@ -193,13 +226,15 @@ esp_sa_create(const struct esp_sa_params *params OVS_UNUSED_WITHOUT_CRYPTO)
         return NULL;
     }
 
-    sa = xzalloc(sizeof *sa);
+    sa = xzalloc_cacheline(sizeof *sa);
     sa->params = *params;
     atomic_add_relaxed(&next_id, 1, &sa->id);
     esp_crypto_init_sa(sa);
     atomic_init(&sa->seq, 0);
-    atomic_init(&sa->n_packets, 0);
-    atomic_init(&sa->n_bytes, 0);
+    for (size_t i = 0; i < ESP_SA_N_COUNTERS; i++) {
+        atomic_init(&sa->counters[i].n_packets, 0);
+        atomic_init(&sa->counters[i].n_bytes, 0);
+    }
     atomic_init(&sa->n_replayed, 0);
     atomic_init(&sa->n_auth_failed, 0);
     atomic_init(&sa->n_malformed, 0);
@@ -228,7 +263,7 @@ esp_sa_destroy(struct esp_sa *sa)
         esp_crypto_uninit_sa(sa);
 #endif
         ovs_memwipe(sa->params.key, sizeof sa->params.key);
-        free(sa);
+        free_cacheline(sa);
     }
 }
 
@@ -257,6 +292,19 @@ esp_stat_inc(atomic_uint64_t *counter, uint64_t n)
 }
 #endif
 
+#ifdef ESP_CRYPTO
+/* Counts a packet with 'payload_len' bytes of payload for this thread. */
+static void
+esp_sa_count_packet(struct esp_sa *sa, size_t payload_len)
+{
+    struct esp_sa_counters *c;
+
+    c = &sa->counters[ovsthread_id_self() & (ESP_SA_N_COUNTERS - 1)];
+    esp_stat_inc(&c->n_packets, 1);
+    esp_stat_inc(&c->n_bytes, payload_len);
+}
+#endif
+
 static uint64_t
 esp_stat_read(const atomic_uint64_t *counter_)
 {
@@ -273,8 +321,12 @@ esp_sa_get_stats(const struct esp_sa *sa_, struct esp_sa_stats *stats)
 {
     struct esp_sa *sa = CONST_CAST(struct esp_sa *, sa_);
 
-    stats->n_packets = esp_stat_read(&sa->n_packets);
-    stats->n_bytes = esp_stat_read(&sa->n_bytes);
+    stats->n_packets = 0;
+    stats->n_bytes = 0;
+    for (size_t i = 0; i < ESP_SA_N_COUNTERS; i++) {
+        stats->n_packets += esp_stat_read(&sa->counters[i].n_packets);
+        stats->n_bytes += esp_stat_read(&sa->counters[i].n_bytes);
+    }
     stats->n_replayed = esp_stat_read(&sa->n_replayed);
     stats->n_auth_failed = esp_stat_read(&sa->n_auth_failed);
     stats->n_malformed = esp_stat_read(&sa->n_malformed);
@@ -863,8 +915,7 @@ esp_seal(struct esp_sa *sa OVS_UNUSED_WITHOUT_CRYPTO,
         return EIO;
     }
 
-    esp_stat_inc(&sa->n_packets, 1);
-    esp_stat_inc(&sa->n_bytes, payload_len);
+    esp_sa_count_packet(sa, payload_len);
     return 0;
 #else
     return EOPNOTSUPP;
@@ -949,8 +1000,7 @@ esp_open(struct esp_header *esp OVS_UNUSED_WITHOUT_CRYPTO,
     *tun_id = sa->params.tun_id;
     *next_hdr = trailer[1];
     *payload_len = ct_len - pad_len - ESP_TRAILER_LEN;
-    esp_stat_inc(&sa->n_packets, 1);
-    esp_stat_inc(&sa->n_bytes, *payload_len);
+    esp_sa_count_packet(sa, *payload_len);
     return 0;
 
 malformed:
