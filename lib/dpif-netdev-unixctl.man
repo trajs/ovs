@@ -228,3 +228,22 @@ recirculation (only in balance-tcp mode).
 When this is the case, the above command prints the load-balancing information
 of the bonds configured in datapath \fIdp\fR showing the interface associated
 with each bucket (hash).
+.
+.IP "\fBconntrack/log-set\fR [\fBenable\fR | \fBdisable\fR] [\fBzones=\fIlist\fR] [\fBrate=\fIN\fR]"
+Configures logging of userspace connection tracking lifecycles (disabled by
+default).  Each connection logs exactly one line, written when it is purged,
+carrying its tuple, when it was created and purged, how long it lived, and
+why it was removed.  \fBzones\fR limits logging to connections in the given
+conntrack zones, as a comma-separated list of zone numbers and ranges such as
+\fB1,5,10\-20\fR, or \fBall\fR (the default).  The line is written inline, by
+whichever thread is already removing the connection (the sweep thread for a
+normal expiry, or whatever thread handles an explicit flush) under the
+\fBconntrack_log\fR vlog module at \fBinfo\fR level; removal of the
+connection itself is unconditional and is never delayed by this.  If more
+than \fIN\fR lines per second (default 1000, 0 for unlimited) would be
+written, the excess is skipped and counted by the
+\fBconntrack_log_ratelimited\fR coverage counter, so that a connection storm
+cannot flood the log.
+.
+.IP "\fBconntrack/log-show\fR"
+Prints the current connection tracking logging configuration.
