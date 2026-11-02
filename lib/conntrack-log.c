@@ -208,9 +208,12 @@ conntrack_log_conn(enum ct_log_reason reason, struct conn *conn)
     if (mark) {
         ds_put_format(&ds, " mark=%#"PRIx32, mark);
     }
-    ds_put_format(&ds, " created=%lld purged=%lld age=%lldms reason=%s",
-                  created_wall, purged_wall, age_ms,
-                  ct_log_reason_name(reason));
+    ds_put_cstr(&ds, " created=");
+    ds_put_strftime_msec(&ds, "%Y-%m-%dT%H:%M:%S.###Z", created_wall, true);
+    ds_put_cstr(&ds, " purged=");
+    ds_put_strftime_msec(&ds, "%Y-%m-%dT%H:%M:%S.###Z", purged_wall, true);
+    ds_put_format(&ds, " age=%lldms reason=%s",
+                  age_ms, ct_log_reason_name(reason));
 
     VLOG_INFO("%s", ds_cstr(&ds));
     ds_destroy(&ds);
