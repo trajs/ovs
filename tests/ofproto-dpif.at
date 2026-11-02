@@ -12335,7 +12335,7 @@ AT_CHECK([grep -c '|conntrack_log' ovs-vswitchd.log], [1], [0
 AT_CHECK([ovs-appctl dpctl/flush-conntrack])
 OVS_WAIT_UNTIL([grep -q 'CT proto=udp' ovs-vswitchd.log])
 
-AT_CHECK([grep '|conntrack_log' ovs-vswitchd.log | sed 's/.*|INFO|//; s/created=[[0-9]]*/created=C/; s/purged=[[0-9]]*/purged=P/; s/age=[[0-9]]*ms/age=Ams/'], [0], [dnl
+AT_CHECK([grep '|conntrack_log' ovs-vswitchd.log | sed 's/.*|INFO|//; s/created=[[0-9-]]*T[[0-9:.]]*Z/created=C/; s/purged=[[0-9-]]*T[[0-9:.]]*Z/purged=P/; s/age=[[0-9]]*ms/age=Ams/'], [0], [dnl
 CT proto=udp zone=5 orig=10.1.1.1:3->10.1.1.2:4 reply=10.1.1.2:4->10.1.1.1:3 created=C purged=P age=Ams reason=flushed
 ])
 
