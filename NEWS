@@ -12,6 +12,10 @@ Post-v4.0.0
        zones, and output is capped at 'rate' lines per second (default
        1000) so that a connection storm cannot flood the log; connections
        are still reclaimed at full speed regardless of the cap.
+     * Added 'conntrack_conn_created'/'conntrack_conn_destroyed' coverage
+       counters, visible via 'ovs-appctl coverage/show', giving the rate of
+       new/expired connections per second for the userspace connection
+       tracker.
 
 
 v4.0.0 - 17 Aug 2026
