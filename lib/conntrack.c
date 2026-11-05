@@ -47,6 +47,8 @@
 
 VLOG_DEFINE_THIS_MODULE(conntrack);
 
+COVERAGE_DEFINE(conntrack_conn_created);
+COVERAGE_DEFINE(conntrack_conn_destroyed);
 COVERAGE_DEFINE(conntrack_full);
 COVERAGE_DEFINE(conntrack_l3csum_checked);
 COVERAGE_DEFINE(conntrack_l3csum_err);
@@ -599,6 +601,7 @@ conn_clean(struct conntrack *ct, struct conn *conn)
 
     ovsrcu_postpone(delete_conn, conn);
     atomic_count_dec(&ct->n_conn);
+    COVERAGE_INC(conntrack_conn_destroyed);
 }
 
 static void
@@ -1123,6 +1126,7 @@ conn_not_found(struct conntrack *ct, struct dp_packet *pkt,
                     &fwd_key_node->cm_node, ctx->hash);
         conn_expire_push_front(ct, nc);
         atomic_count_inc(&ct->n_conn);
+        COVERAGE_INC(conntrack_conn_created);
 
         if (zl) {
             atomic_count_inc(&zl->czl.count);

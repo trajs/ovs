@@ -6,6 +6,11 @@ Post-v4.0.0
    - ovs-vswitchd:
      * Mirror filters now accept masked fields, e.g. "ip,nw_src=10.0.0.0/24"
        in the "filter" column of the Mirror table.
+   - Userspace datapath:
+     * Added 'conntrack_conn_created'/'conntrack_conn_destroyed' coverage
+       counters, visible via 'ovs-appctl coverage/show', giving the rate of
+       new/expired connections per second for the userspace connection
+       tracker.
 
 
 v4.0.0 - 17 Aug 2026
